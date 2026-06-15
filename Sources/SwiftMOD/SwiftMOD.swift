@@ -36,5 +36,28 @@ public enum SwiftMOD {
     /// tag releases. The package itself does not consume this value — it
     /// exists for downstream code that wants to log or surface the decoder
     /// version.
-    public static let version = "0.0.0"
+    public static let version = "0.1.0"
+
+    /// Decode a `.mod` byte stream into a `MODFile`. Equivalent to
+    /// `try MODFile(data: data)`, exposed at the namespace level so
+    /// callers can write `SwiftMOD.decode(data)` to match the call
+    /// shape used by `SwiftS3M.decode` / `SwiftIT.decode`.
+    ///
+    /// ```swift
+    /// let file  = try SwiftMOD.decode(data)
+    /// let mixer = SwiftMOD.mixer(for: file, sampleRate: 48_000)
+    /// ```
+    public static func decode(_ data: Data) throws -> MODFile {
+        try MODFile(data: data)
+    }
+
+    /// Build a `MODMixer` for a parsed module. Convenience that
+    /// matches the namespace decoder above; equivalent to
+    /// `MODMixer(file: file, sampleRate: sampleRate)`.
+    public static func mixer(
+        for file: MODFile,
+        sampleRate: Double
+    ) -> MODMixer {
+        MODMixer(file: file, sampleRate: sampleRate)
+    }
 }

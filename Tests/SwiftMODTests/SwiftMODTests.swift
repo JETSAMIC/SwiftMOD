@@ -6,5 +6,5 @@ import Testing
 // mixer suites land.
 
 @Test func packageBootstrap() {
-    #expect(SwiftMOD.version == "0.0.0")
+    #expect(SwiftMOD.version == "0.1.0")
 }
