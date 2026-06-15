@@ -88,6 +88,15 @@ public final class MODMixer {
         guard count > 0 else { return out }
         if isFinished { return out }
 
+        // Dispatch tick 0 of the very first row before any audio is
+        // produced — otherwise the channels are still empty when we
+        // try to render.
+        if awaitingFirstTick {
+            awaitingFirstTick = false
+            dispatchRow(tick: 0)
+            recomputeFramesPerTick()
+        }
+
         var frame = 0
         while frame < count {
             // Start a new tick if we exhausted the previous one.
@@ -133,14 +142,6 @@ public final class MODMixer {
 
     private func advanceTick() {
         frameInTick = 0
-
-        if awaitingFirstTick {
-            awaitingFirstTick = false
-            dispatchRow(tick: 0)
-            tickInRow = 0
-            recomputeFramesPerTick()
-            return
-        }
 
         tickInRow += 1
         if tickInRow >= song.speed {
