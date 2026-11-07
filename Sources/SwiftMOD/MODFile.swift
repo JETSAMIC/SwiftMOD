@@ -1,16 +1,12 @@
 /// MODFile.swift
 ///
-/// Public surface types for the SwiftMOD parser. Mirrors the shape of
-/// `SwiftS3M.S3MFile` so downstream consumers (Relical's `MODPlayer`)
-/// can adopt the same two-call constructor pattern used for `.s3m`,
-/// `.xm`, and `.it` modules.
-///
-/// File layout reference: `Reference/MOD-Format.md` (clean-room spec).
+/// Public model types for a parsed module. File layout reference:
+/// `Reference/MOD-Format.md`.
 ///
 /// ```
 /// 0x000  20 bytes   Song title (ASCII, NUL-padded)
 /// 0x014 930 bytes   31 sample headers × 30 bytes each
-/// 0x3B6  1 byte     Song length (1..128)
+/// 0x3B6  1 byte     Song length (1...128)
 /// 0x3B7  1 byte     Restart byte
 /// 0x3B8 128 bytes   Pattern order table
 /// 0x438  4 bytes    Format signature (M.K. / M!K! / FLT4 / …)
@@ -18,89 +14,92 @@
 /// (then) …          Sample bodies (signed 8-bit PCM)
 /// ```
 ///
-/// The pre-`M.K.` 15-sample Ultimate Soundtracker variant uses a
-/// 600-byte header instead of 1084 bytes and has no signature.
-///
-/// ## Two-call constructor pattern
-///
-/// ```swift
-/// let file = try MODFile(data: data)
-/// let mixer = MODMixer(file: file, sampleRate: 48_000)
-/// ```
+/// The 15-sample Ultimate Soundtracker variant uses a 600-byte header
+/// (15 sample headers, no signature).
 
 import Foundation
 
 // MARK: - MODFile
 
-/// In-memory representation of a parsed `.mod` module.
+/// An immutable, fully parsed `.mod` module.
 ///
-/// The struct is `Sendable`: every stored property is a value type
-/// or a deeply-immutable array of value types. Safe to hand off to
-/// the audio thread alongside the mixer.
-public struct MODFile: Sendable {
+/// Create one from bytes with ``init(data:)`` (or ``SwiftMOD/decode(_:)``)
+/// and play it with ``MODMixer``. The value is `Sendable` and can be
+/// shared freely across threads.
+public struct MODFile: Sendable, Equatable {
 
-    // MARK: Public header fields
-
-    /// Song title (offset `0x000`, 20 bytes). Trimmed of trailing
-    /// NUL / non-printable bytes.
+    /// Song title (offset `0x000`, 20 bytes), cut at the first NUL with
+    /// trailing spaces/control bytes removed. Bytes outside ASCII are
+    /// decoded as ISO Latin-1.
     public let title: String
 
-    /// Format signature detected at offset `0x438`. For the
-    /// 15-sample Ultimate Soundtracker variant this is
-    /// `.noSignature15Sample` and the file uses a 600-byte header.
+    /// The format signature at offset `0x438`, or
+    /// ``MODSignature/noSignature15Sample`` for 15-sample modules.
     public let signature: MODSignature
 
-    /// Number of mixer channels implied by `signature`.
+    /// Number of pattern channels (`1...32`), implied by ``signature``.
     public let channelCount: Int
 
-    /// Sample table (31 entries for modern variants, 15 for the
-    /// no-signature variant). Sample 0 is conventionally empty; the
-    /// array is 0-indexed but pattern cells reference samples
-    /// 1-based.
+    /// Sample slots: 31 for tagged modules, 15 for Soundtracker
+    /// modules. Pattern cells reference samples 1-based, so cell
+    /// sample number `n` is `samples[n - 1]`.
     public let samples: [MODSample]
 
-    /// Used order-table length. `1..128`.
+    /// Number of used order positions, `1...128`.
     public let songLength: Int
 
-    /// Restart byte (CIAA timer / loop-back position). ProTracker
-    /// hard-codes this to `0x7F`. A robust player treats values
-    /// `>= songLength` as "restart at 0."
+    /// The restart byte at `0x3B7`. ProTracker writes `0x7F` and
+    /// ignores it; NoiseTracker used it as the restart order. The mixer
+    /// honours it only when looping (`MODMixer.Options.loopSong`) and
+    /// only if it is `< songLength`.
     public let restartByte: UInt8
 
-    /// Full 128-byte order table — `patternOrder[i]` for `i <
-    /// songLength` selects the pattern at order position `i`.
+    /// The full 128-entry order table. Only `patternOrder[0..<songLength]`
+    /// is played; entries past `songLength` are unused padding and may
+    /// reference patterns that are not stored. For `FLT8` modules the
+    /// stored values are halved so they index ``patterns`` directly.
     public let patternOrder: [UInt8]
 
-    /// Decoded patterns, length = `max(patternOrder[0..<songLength])
-    /// + 1`. Indexed by pattern number, not by order position.
+    /// Decoded patterns, indexed by pattern number (the values in
+    /// ``patternOrder``), each 64 rows × ``channelCount`` cells.
     public let patterns: [MODPattern]
 
-    // MARK: Player-facing aliases
+    /// `true` when the file ended before all sample bodies were read.
+    /// Such files are common in the wild and are loaded leniently: the
+    /// affected samples are shortened to the bytes actually present.
+    public let isTruncated: Bool
 
-    /// Default ticks-per-row. MOD has no header field for this — the
-    /// constant `6` is the ProTracker default, set via effect `Fxx`
-    /// at runtime if the song needs a different value. Exposed as a
-    /// `UInt8` to mirror `S3MFile.initialSpeed`.
+    // MARK: Player-facing constants
+
+    /// Initial ticks per row. MOD has no header field for this; it is
+    /// always ProTracker's default `6` until an `Fxx` command changes it.
     public var initialSpeed: UInt8 { 6 }
 
-    /// Default tempo in BPM-derived units. Same story as
-    /// `initialSpeed` — the canonical ProTracker default is `125`.
+    /// Initial tempo in BPM (tick rate = BPM × 0.4 Hz). Always
+    /// ProTracker's default `125` (50 Hz ticks) until `Fxx` (`xx ≥ 0x20`)
+    /// changes it.
     public var initialTempo: UInt8 { 125 }
 
-    /// Convenience alias used by Relical's `MODPlayer` to compute
-    /// estimated duration without poking at the order array.
+    /// Alias of ``songLength``.
     public var orderCount: Int { songLength }
 
     // MARK: Init
 
-    /// Parse a `.mod` byte stream. Delegates to `MODParser.parse`.
+    /// Parse a module from its bytes.
+    ///
+    /// Tagged 31-sample modules are recognised by their signature; data
+    /// without a known tag is accepted as a 15-sample Soundtracker
+    /// module only if its header, order table and pattern data pass
+    /// validation.
+    ///
+    /// - Parameter data: The complete file contents.
+    /// - Throws: ``MODError`` if the data is not a module or is cut short
+    ///   before the end of the pattern data. A file truncated inside the
+    ///   sample bodies loads successfully with ``isTruncated`` set.
     public init(data: Data) throws {
-        let parsed = try MODParser.parse(data)
-        self = parsed
+        self = try MODParser.parse(data)
     }
 
-    /// Internal initializer used by `MODParser`. Public types are
-    /// `let`s so the parser builds the value once and hands it back.
     init(
         title: String,
         signature: MODSignature,
@@ -109,7 +108,8 @@ public struct MODFile: Sendable {
         songLength: Int,
         restartByte: UInt8,
         patternOrder: [UInt8],
-        patterns: [MODPattern]
+        patterns: [MODPattern],
+        isTruncated: Bool
     ) {
         self.title = title
         self.signature = signature
@@ -119,199 +119,115 @@ public struct MODFile: Sendable {
         self.restartByte = restartByte
         self.patternOrder = patternOrder
         self.patterns = patterns
+        self.isTruncated = isTruncated
     }
 }
 
 // MARK: - MODSample
 
-/// One entry from the 30-byte sample-header table, plus its raw
-/// PCM body. Lengths are byte counts (the file stores word counts;
-/// the parser does the `× 2` conversion).
-public struct MODSample: Sendable {
+/// One sample slot: its 30-byte header plus its signed 8-bit PCM body.
+///
+/// All lengths and offsets are in **bytes** (the file stores 16-bit
+/// words; the parser doubles them). The loop fields are validated:
+/// whenever ``loops`` is `true`, `loopStart + loopLength <= length`.
+public struct MODSample: Sendable, Equatable {
 
-    /// Sample name (22 bytes, ASCII / Latin-1, NUL-padded).
+    /// Sample name (22 bytes, NUL-padded; trailing spaces removed).
     public let name: String
 
-    /// Sample length in **bytes** (file stores words; doubled).
+    /// Length in bytes; always equal to `data.count`.
     public let length: Int
 
-    /// Finetune in `-8..+7` steps. Encoded in the file as a 4-bit
-    /// signed nibble.
+    /// Finetune `-8...+7` (eighths of a semitone), from the low nibble
+    /// of header byte 24. Always `0` for 15-sample modules.
     public let finetune: Int8
 
-    /// Default volume `0..64`.
+    /// Default volume `0...64` (header values above 64 are clamped).
     public let volume: UInt8
 
-    /// Loop start in **bytes**.
+    /// Loop start in bytes. `0` when the sample does not loop.
     public let loopStart: Int
 
-    /// Loop length in **bytes**. `≤ 2` means "no loop" (ProTracker
-    /// stores `1 word = 2 bytes` to satisfy Paula's always-looping
-    /// hardware).
+    /// Loop length in bytes. `0` when the sample does not loop.
+    ///
+    /// ProTracker stores a loop length of 1 word (2 bytes) for one-shot
+    /// samples, because Paula always loops; a stored length of 0 or 1
+    /// word therefore means "no loop" and is reported here as `0`.
     public let loopLength: Int
 
-    /// Signed 8-bit PCM body. Empty for length-zero placeholders.
+    /// Signed 8-bit PCM, `-128...127`.
     public let data: [Int8]
 
-    /// `true` when `loopLength > 2`. Convenience for mixer code.
+    /// `true` when the sample has a loop longer than one word.
     public var loops: Bool { loopLength > 2 }
 
-    /// Empty sentinel — used for the conventional "sample 0" slot
-    /// and for any sample whose header was zero-length.
+    /// An empty, silent sample slot.
     public static let empty = MODSample(
-        name: "",
-        length: 0,
-        finetune: 0,
-        volume: 0,
-        loopStart: 0,
-        loopLength: 0,
-        data: []
+        name: "", length: 0, finetune: 0, volume: 0,
+        loopStart: 0, loopLength: 0, data: []
     )
-}
 
-// MARK: - MODSignature
-
-/// Four-byte format tag at offset `0x438`, mapped to a Swift case
-/// per the [Format signature dispatch] table in the spec doc.
-///
-/// `noSignature15Sample` covers the pre-NoiseTracker Ultimate
-/// Soundtracker variant, which had no signature and only 15
-/// sample slots.
-public enum MODSignature: Sendable, Equatable, Hashable {
-    case mk             // "M.K."  — NoiseTracker / ProTracker canonical, 4ch
-    case mkExtended     // "M!K!"  — ProTracker, 4ch, > 64 patterns
-    case mAndK          // "M&K!"  — NoiseTracker variant, 4ch
-    case nT             // "N.T."  — NoiseTracker original, 4ch
-    case flt4           // "FLT4"  — StarTrekker 4-channel
-    case flt8           // "FLT8"  — StarTrekker 8-channel paired
-    case exo4           // "EXO4"  — StarTrekker EXO 4ch
-    case exo8           // "EXO8"  — StarTrekker EXO 8ch
-    case twoCHN         // "2CHN"
-    case sixCHN         // "6CHN"
-    case eightCHN       // "8CHN"
-    case xxCH(Int)      // "10CH"..."32CH"
-    case xxCN(Int)      // "10CN"..."32CN"
-    case octa           // "OCTA"  — Oktalyzer 8ch
-    case okta           // "OKTA"  — Oktalyzer 8ch alt tag
-    case cd61           // "CD61"  — Falcon 6ch
-    case cd81           // "CD81"  — Falcon 8ch
-    case fa04           // "FA04"
-    case fa06           // "FA06"
-    case fa08           // "FA08"
-    case tdz(Int)       // "TDZ1".."TDZ3"
-    case noSignature15Sample
-
-    /// Channels implied by the tag.
-    public var channelCount: Int {
-        switch self {
-        case .mk, .mkExtended, .mAndK, .nT, .flt4, .exo4, .fa04:
-            return 4
-        case .flt8, .exo8, .eightCHN, .octa, .okta, .cd81, .fa08:
-            return 8
-        case .twoCHN:
-            return 2
-        case .sixCHN, .cd61, .fa06:
-            return 6
-        case .xxCH(let n), .xxCN(let n):
-            return n
-        case .tdz(let n):
-            return n
-        case .noSignature15Sample:
-            return 4
-        }
-    }
-
-    /// Sample-slot count implied by the tag. 31 for every modern
-    /// variant; 15 for the no-signature legacy.
-    public var sampleSlotCount: Int {
-        self == .noSignature15Sample ? 15 : 31
-    }
-
-    /// Inspect the 4-byte slot at offset 1080 (or wherever the
-    /// caller chooses — the parser slices the right window) and
-    /// return the matching case, or `nil` if no known tag fits.
-    public static func detect(in data: Data) -> MODSignature? {
-        guard data.count >= 1084 else { return nil }
-        let tag = data.subdata(in: 1080..<1084)
-        return detect(tag: tag)
-    }
-
-    /// Same as `detect(in:)` but takes the raw 4-byte tag directly.
-    /// Exposed for the test harness; the parser uses `detect(in:)`.
-    public static func detect(tag: Data) -> MODSignature? {
-        guard tag.count == 4 else { return nil }
-        let bytes = Array(tag)
-        let ascii = String(bytes: bytes, encoding: .ascii) ?? ""
-        switch ascii {
-        case "M.K.": return .mk
-        case "M!K!": return .mkExtended
-        case "M&K!": return .mAndK
-        case "N.T.": return .nT
-        case "FLT4": return .flt4
-        case "FLT8": return .flt8
-        case "EXO4": return .exo4
-        case "EXO8": return .exo8
-        case "2CHN": return .twoCHN
-        case "6CHN": return .sixCHN
-        case "8CHN": return .eightCHN
-        case "OCTA": return .octa
-        case "OKTA": return .okta
-        case "CD61": return .cd61
-        case "CD81": return .cd81
-        case "FA04": return .fa04
-        case "FA06": return .fa06
-        case "FA08": return .fa08
-        default: break
-        }
-        // Generalized "xxCH" / "xxCN" — two ASCII digits + suffix.
-        if ascii.count == 4 {
-            let prefix = String(ascii.prefix(2))
-            let suffix = String(ascii.suffix(2))
-            if let n = Int(prefix), n > 0, n <= 32 {
-                if suffix == "CH" { return .xxCH(n) }
-                if suffix == "CN" { return .xxCN(n) }
-            }
-            // TDZ1..TDZ9 — single digit, 1..3 useful.
-            if ascii.hasPrefix("TDZ"), let n = Int(ascii.suffix(1)), n >= 1, n <= 9 {
-                return .tdz(n)
-            }
-        }
-        return nil
+    init(name: String, length: Int, finetune: Int8, volume: UInt8,
+         loopStart: Int, loopLength: Int, data: [Int8]) {
+        self.name = name
+        self.length = length
+        self.finetune = finetune
+        self.volume = volume
+        self.loopStart = loopStart
+        self.loopLength = loopLength
+        self.data = data
     }
 }
 
 // MARK: - MODPattern + MODCell
 
-/// 64-row × N-channel grid of decoded pattern cells.
-public struct MODPattern: Sendable {
-    /// Row-major. `rows[r]` has `channelCount` cells.
+/// One pattern: 64 rows of ``MODRow``.
+public struct MODPattern: Sendable, Equatable {
+
+    /// The 64 rows, in playback order. Each row has one cell per channel.
     public let rows: [MODRow]
 
+    /// Create a pattern from its rows.
+    /// - Parameter rows: Normally 64 rows of `channelCount` cells.
     public init(rows: [MODRow]) {
         self.rows = rows
     }
 }
 
-/// One row of a pattern — `channelCount` cells.
+/// One pattern row: one ``MODCell`` per channel, in channel order.
 public typealias MODRow = [MODCell]
 
 /// One decoded 4-byte pattern cell.
+///
+/// ```
+/// byte 0: ssss pppp   sample high nibble, period bits 11-8
+/// byte 1: pppp pppp   period bits 7-0
+/// byte 2: ssss eeee   sample low nibble, effect command
+/// byte 3: xxxx yyyy   effect parameter
+/// ```
 public struct MODCell: Sendable, Equatable, Hashable {
-    /// 12-bit Amiga period. `0` = no note this cell.
+
+    /// 12-bit Amiga period (`0...4095`); `0` means no note.
     public let period: UInt16
 
-    /// 1-based sample index (1..31). `0` = "continue previous
-    /// sample." Some files store > 31; the parser leaves the raw
-    /// value here.
+    /// 1-based sample number (`0...255` as stored); `0` means no sample
+    /// change. Numbers beyond the module's sample count are ignored
+    /// during playback.
     public let sampleNumber: UInt8
 
-    /// Effect command nibble `0..F`.
+    /// Effect command `0x0...0xF`.
     public let effect: UInt8
 
-    /// Effect parameter byte. For most commands the upper / lower
-    /// nibbles are independent (e.g. arpeggio `0xy`).
+    /// Effect parameter byte. For `Exy` commands the high nibble is the
+    /// sub-command.
     public let effectParam: UInt8
 
+    /// Create a cell.
+    /// - Parameters:
+    ///   - period: Amiga period, `0` for no note.
+    ///   - sampleNumber: 1-based sample number, `0` for none.
+    ///   - effect: Effect command nibble.
+    ///   - effectParam: Effect parameter byte.
     public init(period: UInt16, sampleNumber: UInt8, effect: UInt8, effectParam: UInt8) {
         self.period = period
         self.sampleNumber = sampleNumber
@@ -319,10 +235,13 @@ public struct MODCell: Sendable, Equatable, Hashable {
         self.effectParam = effectParam
     }
 
-    /// Resolve the period back to a note via the canonical
-    /// finetune-0 period table. Returns `nil` for period `0`
-    /// ("no note") or for periods outside the legal `113..856`
-    /// range.
+    /// `true` when all four bytes of the cell are zero.
+    public var isEmpty: Bool {
+        period == 0 && sampleNumber == 0 && effect == 0 && effectParam == 0
+    }
+
+    /// The note for ``period`` in the finetune-0 table (±1 tolerance),
+    /// or `nil` for no note or a period outside C-1...B-3.
     public var note: MODNote? {
         guard period != 0 else { return nil }
         return MODNote.from(period: period)
@@ -331,32 +250,39 @@ public struct MODCell: Sendable, Equatable, Hashable {
 
 // MARK: - MODNote
 
-/// Decoded note (octave + semitone) used for display and for
-/// effect-target resolution. `noteIndex` is `0..35` over the
-/// canonical 3-octave × 12-semitone table; `0` = C-1, `35` = B-3.
+/// A note in ProTracker's three-octave range.
 public struct MODNote: Sendable, Equatable, Hashable {
+
+    /// Note index `0..<36`: `0` is C-1, `12` is C-2, `35` is B-3.
     public let noteIndex: Int
 
-    /// Note name `"C-1"`, `"C#1"`, `"D-1"`, … `"B-3"`.
+    /// Create a note.
+    /// - Parameter noteIndex: `0..<36`.
+    /// - Returns: `nil` if `noteIndex` is out of range.
+    public init?(noteIndex: Int) {
+        guard (0..<36).contains(noteIndex) else { return nil }
+        self.noteIndex = noteIndex
+    }
+
+    /// Tracker-style name: `"C-1"`, `"C#1"`, … `"B-3"`.
     public var name: String {
         let names = ["C-", "C#", "D-", "D#", "E-", "F-",
                      "F#", "G-", "G#", "A-", "A#", "B-"]
-        let octave = (noteIndex / 12) + 1
-        let semitone = noteIndex % 12
-        return "\(names[semitone])\(octave)"
+        return "\(names[noteIndex % 12])\(noteIndex / 12 + 1)"
     }
 
-    /// Look up a note by its period using the finetune-0 table.
-    /// Tolerates ±1 (Amiga period rounding) — many trackers wrote
-    /// periods that drifted by one between authoring sessions.
+    /// The period of this note at the given finetune.
+    /// - Parameter finetune: `-8...7`.
+    /// - Returns: The ProTracker period, or `0` for an invalid finetune.
+    public func period(finetune: Int8 = 0) -> UInt16 {
+        MODPeriod.period(noteIndex: noteIndex, finetune: finetune)
+    }
+
+    /// Find the note whose finetune-0 period is within ±1 of `period`.
+    /// - Parameter period: An Amiga period.
+    /// - Returns: The note, or `nil` if no C-1...B-3 entry matches.
     public static func from(period: UInt16) -> MODNote? {
-        // Finetune-0 table, octave 1 + octave 2 + octave 3.
-        let table: [UInt16] = [
-            856, 808, 762, 720, 678, 640, 604, 570, 538, 508, 480, 453,
-            428, 404, 381, 360, 339, 320, 302, 285, 269, 254, 240, 226,
-            214, 202, 190, 180, 170, 160, 151, 143, 135, 127, 120, 113
-        ]
-        for (i, p) in table.enumerated() where abs(Int(p) - Int(period)) <= 1 {
+        for i in 0..<36 where abs(Int(MODPeriod.period(noteIndex: i, finetune: 0)) - Int(period)) <= 1 {
             return MODNote(noteIndex: i)
         }
         return nil
@@ -365,35 +291,36 @@ public struct MODNote: Sendable, Equatable, Hashable {
 
 // MARK: - MODError
 
-/// Throwing surface for the parser. Cases are deliberately granular
-/// so callers can present meaningful errors (Relical's error UI does
-/// this for `.s3m` and will do the same for `.mod`).
-public enum MODError: Error, LocalizedError, Sendable {
-    /// File ended mid-stage (`"header"`, `"sample-header"`,
-    /// `"pattern"`, `"sample-body"`).
-    case truncated(stage: String)
+/// Errors thrown while parsing a module.
+public enum MODError: Error, Sendable, Equatable, LocalizedError {
 
-    /// 4-byte tag at offset 1080 doesn't match any known signature
-    /// **and** the 15-sample fallback also failed to validate.
-    case unsupportedSignature(String)
+    /// Regions of the file, used to report where data ran out.
+    public enum Section: String, Sendable, Equatable {
+        /// The fixed header (title, sample headers, order table, signature).
+        case header
+        /// The pattern data following the header.
+        case patterns
+    }
 
-    /// A sample header's `length` would read past the end of `data`.
-    case sampleOverrun
+    /// The file ended inside `section`.
+    case truncated(Section)
 
-    /// Sample count outside `[15, 31]`. Defensive only — the
-    /// dispatch table never produces other values.
-    case invalidSampleCount(Int)
+    /// No known signature at offset 1080, and the data does not
+    /// validate as a 15-sample Soundtracker module.
+    case unrecognizedFormat
 
+    /// The song-length byte is outside `1...128`.
+    case invalidSongLength(Int)
+
+    /// A human-readable description of the error.
     public var errorDescription: String? {
         switch self {
-        case .truncated(let stage):
-            return "MOD file truncated during \(stage)."
-        case .unsupportedSignature(let tag):
-            return "MOD file has unsupported signature '\(tag)'."
-        case .sampleOverrun:
-            return "MOD sample body extends past end of file."
-        case .invalidSampleCount(let n):
-            return "MOD file declares an invalid sample count (\(n))."
+        case .truncated(let section):
+            return "MOD file is truncated in the \(section.rawValue)."
+        case .unrecognizedFormat:
+            return "Data is not a recognised MOD module."
+        case .invalidSongLength(let n):
+            return "MOD song length \(n) is outside 1...128."
         }
     }
 }

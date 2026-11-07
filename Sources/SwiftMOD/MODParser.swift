@@ -1,406 +1,281 @@
 /// MODParser.swift
 ///
-/// Pure-Swift decoder for Amiga `.mod` module files. Reads:
+/// Decoder for Amiga `.mod` files. Every offset and length read from
+/// the file is validated against the data before use; a malformed file
+/// throws `MODError`, never traps.
 ///
-/// 1. 4-byte format signature at offset 1080 (fall back to the
-///    15-sample no-signature variant if absent).
-/// 2. 20-byte song title at offset 0.
-/// 3. 31 (or 15) sample headers × 30 bytes — name, length-in-words,
-///    finetune nibble, default volume, loop start, loop length.
-/// 4. Song length byte, restart byte, 128-byte order table.
-/// 5. Pattern data — each pattern = 64 rows × `channelCount` × 4
-///    bytes; cell encoding per the spec.
-/// 6. Signed-8-bit PCM sample bodies, concatenated in sample-index
-///    order.
+/// Layout handling (see `Reference/MOD-Format.md`):
 ///
-/// Numbers in sample headers are **big-endian** (the Amiga is
-/// big-endian); we use the helpers in `Data+MODReader.swift`.
+/// - 31-sample modules are identified by the tag at offset 1080.
+/// - Data with no known tag is parsed as a 15-sample Soundtracker module
+///   only if it passes structural validation (song length, order
+///   values, sample header ranges, and plausible pattern cells).
+/// - The number of stored patterns is `max(order table) + 1` over all
+///   128 entries (what ProTracker writes), falling back to the used
+///   entries only when the larger count does not fit the file.
+/// - `FLT8` patterns are stored as 4-channel pairs and are reassembled
+///   into 8-channel patterns.
+/// - Sample bodies cut off by the end of the file are shortened rather
+///   than rejected (`MODFile.isTruncated`).
 ///
-/// **Not** implemented in this commit:
-///
-/// - FLT8 "paired pattern" assembly (the parser reports
-///   `signature == .flt8` and `channelCount == 8`; pattern data is
-///   read as two 4-channel patterns and stitched into 8-channel
-///   patterns of half the count). See the spec doc for the rule.
-/// - Sample-body overlap validation. We compute the expected total
-///   length and only throw `sampleOverrun` when an individual
-///   sample would read past `data.endIndex`.
-///
-/// No source code from libxmp, OpenMPT, MikMod, or Schism Tracker
-/// was consulted in writing this parser.
+/// No source code from libxmp, OpenMPT, MikMod, or Schism Tracker was
+/// consulted in writing this parser.
 
 import Foundation
 
 enum MODParser {
 
+    private struct SampleHeader {
+        var name: String
+        var lengthBytes: Int
+        var finetune: Int8
+        var volume: UInt8
+        var loopStartBytes: Int
+        var loopLengthBytes: Int
+    }
+
+    private struct Layout {
+        let signature: MODSignature
+        let headerSize: Int
+        let sampleSlots: Int
+        let songLengthOffset: Int
+    }
+
     // MARK: - Entry point
 
     static func parse(_ data: Data) throws -> MODFile {
+        let bytes = [UInt8](data)
 
-        // Detect signature first — that determines header size and
-        // channel count, which we need before we can read anything
-        // else with confidence.
-        let signature = MODSignature.detect(in: data) ?? .noSignature15Sample
-
-        if case .noSignature15Sample = signature {
-            return try parse15SampleVariant(data: data)
+        if bytes.count >= 1084,
+           let signature = MODSignature.detect(bytes: Array(bytes[1080..<1084])) {
+            return try parse(bytes, layout: Layout(
+                signature: signature, headerSize: 1084,
+                sampleSlots: 31, songLengthOffset: 950))
         }
-        return try parse31SampleVariant(data: data, signature: signature)
+
+        // No tag. A valid Soundtracker module is at least
+        // 600 header + 1024 pattern bytes, so anything shorter than the
+        // 31-sample header is reported as truncated.
+        guard bytes.count >= 1084 else { throw MODError.truncated(.header) }
+        let layout = Layout(signature: .noSignature15Sample, headerSize: 600,
+                            sampleSlots: 15, songLengthOffset: 470)
+        guard looksLikeSoundtracker(bytes) else { throw MODError.unrecognizedFormat }
+        return try parse(bytes, layout: layout)
     }
 
-    // MARK: - 31-sample variant
+    // MARK: - Common decoder
 
-    private static func parse31SampleVariant(
-        data: Data,
-        signature: MODSignature
-    ) throws -> MODFile {
+    private static func parse(_ bytes: [UInt8], layout: Layout) throws -> MODFile {
+        guard bytes.count >= layout.headerSize else { throw MODError.truncated(.header) }
+        let is15 = layout.sampleSlots == 15
+        let signature = layout.signature
 
-        let channelCount = signature.channelCount
-        let sampleSlots = 31
-        let headerSize = 1084
-
-        guard data.count >= headerSize else {
-            throw MODError.truncated(stage: "header")
+        // Title + sample headers.
+        let title = readString(bytes, 0, 20)
+        var headers: [SampleHeader] = []
+        headers.reserveCapacity(layout.sampleSlots)
+        for i in 0..<layout.sampleSlots {
+            headers.append(readSampleHeader(bytes, at: 20 + i * 30, soundtracker: is15))
         }
 
-        // 1. Title (offset 0, 20 bytes).
-        let title = readASCII(data, range: 0..<20)
+        // Song length, restart byte, order table.
+        let songLength = Int(bytes[layout.songLengthOffset])
+        guard (1...128).contains(songLength) else {
+            throw MODError.invalidSongLength(songLength)
+        }
+        let restartByte = bytes[layout.songLengthOffset + 1]
+        let orderBase = layout.songLengthOffset + 2
+        var orders = Array(bytes[orderBase..<(orderBase + 128)])
 
-        // 2. Sample headers (31 × 30 bytes, starting at offset 20).
-        // Header-only fields here; bodies are read later, once we
-        // know the offset.
-        var sampleHeaders: [(name: String,
-                             byteLength: Int,
-                             finetune: Int8,
-                             volume: UInt8,
-                             loopStart: Int,
-                             loopLength: Int)] = []
-        sampleHeaders.reserveCapacity(sampleSlots)
+        // FLT8 stores only even order values (each names the first
+        // half of a 4-channel pair); halve them so they index the
+        // reassembled 8-channel patterns.
+        let paired = signature.isStarTrekkerPaired
+        if paired { orders = orders.map { $0 / 2 } }
 
-        for i in 0..<sampleSlots {
-            let base = 20 + i * 30
-            guard base + 30 <= data.count else {
-                throw MODError.truncated(stage: "sample-header")
+        // Pattern count.
+        let channels = signature.channelCount
+        let patternBytes = 64 * channels * 4
+        let sampleBytes = headers.reduce(0) { $0 + $1.lengthBytes }
+        let maxUsed = Int(orders[0..<songLength].max() ?? 0)
+        let maxAll = Int(orders.max() ?? 0)
+        var patternCount = maxAll + 1
+        if maxAll != maxUsed {
+            let allEnd = layout.headerSize + (maxAll + 1) * patternBytes
+            let usedEnd = layout.headerSize + (maxUsed + 1) * patternBytes
+            if allEnd > bytes.count || (allEnd + sampleBytes > bytes.count
+                                        && usedEnd + sampleBytes <= bytes.count) {
+                patternCount = maxUsed + 1
             }
-            let name = readASCII(data, range: base..<(base + 22))
-            let wordLength = Int(readUInt16BE(data, at: base + 22))
-            let finetuneNibble = data[data.startIndex + base + 24] & 0x0F
-            let finetune: Int8 = finetuneNibble >= 8
-                ? Int8(Int(finetuneNibble) - 16)
-                : Int8(finetuneNibble)
-            let volume = min(data[data.startIndex + base + 25], 64)
-            let loopStartWords = Int(readUInt16BE(data, at: base + 26))
-            let loopLengthWords = Int(readUInt16BE(data, at: base + 28))
-
-            sampleHeaders.append((
-                name: name,
-                byteLength: wordLength * 2,
-                finetune: finetune,
-                volume: volume,
-                loopStart: loopStartWords * 2,
-                loopLength: loopLengthWords * 2
-            ))
         }
 
-        // 3. Song length + restart byte (offsets 0x3B6 / 0x3B7).
-        let songLengthRaw = Int(data[data.startIndex + 0x3B6])
-        let songLength = max(1, min(songLengthRaw, 128))
-        let restartByte = data[data.startIndex + 0x3B7]
-
-        // 4. Order table (128 bytes at 0x3B8).
-        var patternOrder = [UInt8](repeating: 0, count: 128)
-        for i in 0..<128 {
-            patternOrder[i] = data[data.startIndex + 0x3B8 + i]
-        }
-
-        // 5. Pattern count = max(orderTable[0..<songLength]) + 1.
-        let usedOrders = patternOrder.prefix(songLength)
-        let maxOrder = usedOrders.max() ?? 0
-        let patternCount = Int(maxOrder) + 1
-
-        // 6. Pattern data — each pattern is 64 × channelCount × 4.
-        let patternBytes = 64 * channelCount * 4
-        let patternsBase = headerSize
-        let patternsEnd = patternsBase + patternCount * patternBytes
-        guard patternsEnd <= data.count else {
-            throw MODError.truncated(stage: "pattern")
-        }
+        let patternsEnd = layout.headerSize + patternCount * patternBytes
+        guard patternsEnd <= bytes.count else { throw MODError.truncated(.patterns) }
 
         var patterns: [MODPattern] = []
         patterns.reserveCapacity(patternCount)
         for p in 0..<patternCount {
-            let patBase = patternsBase + p * patternBytes
-            patterns.append(try decodePattern(
-                data: data,
-                at: patBase,
-                channelCount: channelCount
-            ))
+            let base = layout.headerSize + p * patternBytes
+            if paired {
+                // Two consecutive 4-channel blocks: channels 0-3 then 4-7.
+                let left = decodeRows(bytes, at: base, channels: 4)
+                let right = decodeRows(bytes, at: base + 1024, channels: 4)
+                patterns.append(MODPattern(rows: zip(left, right).map { $0 + $1 }))
+            } else {
+                patterns.append(MODPattern(rows: decodeRows(bytes, at: base, channels: channels)))
+            }
         }
 
-        // 7. Sample bodies — concatenated immediately after the
-        // pattern block.
+        // Sample bodies.
         var samples: [MODSample] = []
-        samples.reserveCapacity(sampleSlots)
-        var bodyCursor = patternsEnd
-
-        for header in sampleHeaders {
-            let len = header.byteLength
-            var pcm: [Int8] = []
-            if len > 0 {
-                let bodyEnd = bodyCursor + len
-                // Tolerate truncation at the file's tail — many
-                // real `.mod` files in the wild are truncated by a
-                // few bytes from sample-trailing silence having
-                // been trimmed by lossy archivers.
-                let safeEnd = min(bodyEnd, data.count)
-                guard bodyCursor <= data.count else {
-                    throw MODError.sampleOverrun
-                }
-                pcm.reserveCapacity(safeEnd - bodyCursor)
-                for i in bodyCursor..<safeEnd {
-                    pcm.append(Int8(bitPattern: data[data.startIndex + i]))
-                }
-                // Pad if the file was short — gives the mixer a
-                // predictable buffer.
-                if safeEnd < bodyEnd {
-                    pcm.append(contentsOf: Array(repeating: Int8(0),
-                                                 count: bodyEnd - safeEnd))
-                }
-                bodyCursor = bodyEnd
-            }
-            samples.append(MODSample(
-                name: header.name,
-                length: header.byteLength,
-                finetune: header.finetune,
-                volume: header.volume,
-                loopStart: header.loopStart,
-                loopLength: header.loopLength,
-                data: pcm
-            ))
+        samples.reserveCapacity(layout.sampleSlots)
+        var cursor = patternsEnd
+        var truncated = false
+        for h in headers {
+            let start = min(cursor, bytes.count)
+            let end = min(cursor + h.lengthBytes, bytes.count)
+            if end - start < h.lengthBytes { truncated = true }
+            let pcm = bytes[start..<end].map { Int8(bitPattern: $0) }
+            cursor += h.lengthBytes
+            samples.append(makeSample(h, data: pcm, soundtracker: is15))
         }
 
         return MODFile(
             title: title,
             signature: signature,
-            channelCount: channelCount,
+            channelCount: channels,
             samples: samples,
             songLength: songLength,
             restartByte: restartByte,
-            patternOrder: patternOrder,
-            patterns: patterns
+            patternOrder: orders,
+            patterns: patterns,
+            isTruncated: truncated
         )
     }
 
-    // MARK: - 15-sample (Ultimate Soundtracker) variant
+    // MARK: - Samples
 
-    /// Pre-NoiseTracker layout: 600-byte header, 15 sample slots,
-    /// 4 channels, no signature.
-    private static func parse15SampleVariant(data: Data) throws -> MODFile {
-        let channelCount = 4
-        let sampleSlots = 15
-        let headerSize = 600
+    private static func readSampleHeader(_ b: [UInt8], at base: Int, soundtracker: Bool) -> SampleHeader {
+        let nibble = b[base + 24] & 0x0F
+        return SampleHeader(
+            name: readString(b, base, 22),
+            lengthBytes: Int(readUInt16BE(b, base + 22)) * 2,
+            // The pre-NoiseTracker byte at +24 is not a finetune.
+            finetune: soundtracker ? 0 : Int8(bitPattern: nibble << 4) >> 4,
+            volume: min(b[base + 25], 64),
+            loopStartBytes: Int(readUInt16BE(b, base + 26)) * 2,
+            loopLengthBytes: Int(readUInt16BE(b, base + 28)) * 2
+        )
+    }
 
-        guard data.count >= headerSize else {
-            throw MODError.truncated(stage: "header")
-        }
-
-        let title = readASCII(data, range: 0..<20)
-
-        var sampleHeaders: [(name: String,
-                             byteLength: Int,
-                             finetune: Int8,
-                             volume: UInt8,
-                             loopStart: Int,
-                             loopLength: Int)] = []
-        sampleHeaders.reserveCapacity(sampleSlots)
-
-        for i in 0..<sampleSlots {
-            let base = 20 + i * 30
-            let name = readASCII(data, range: base..<(base + 22))
-            let wordLength = Int(readUInt16BE(data, at: base + 22))
-            // Finetune doesn't exist in the pre-NoiseTracker
-            // header (the byte was a "repeat" hint); treat as 0.
-            let finetune: Int8 = 0
-            let volume = min(data[data.startIndex + base + 25], 64)
-            let loopStartWords = Int(readUInt16BE(data, at: base + 26))
-            let loopLengthWords = Int(readUInt16BE(data, at: base + 28))
-            sampleHeaders.append((
-                name: name,
-                byteLength: wordLength * 2,
-                finetune: finetune,
-                volume: volume,
-                loopStart: loopStartWords * 2,
-                loopLength: loopLengthWords * 2
-            ))
-        }
-
-        let songLengthRaw = Int(data[data.startIndex + 470])    // 0x1D6
-        let songLength = max(1, min(songLengthRaw, 128))
-        let restartByte = data[data.startIndex + 471]           // 0x1D7
-
-        var patternOrder = [UInt8](repeating: 0, count: 128)
-        for i in 0..<128 {
-            patternOrder[i] = data[data.startIndex + 472 + i]   // 0x1D8
-        }
-        let maxOrder = patternOrder.prefix(songLength).max() ?? 0
-        let patternCount = Int(maxOrder) + 1
-
-        let patternBytes = 64 * channelCount * 4
-        let patternsBase = headerSize
-        let patternsEnd = patternsBase + patternCount * patternBytes
-        guard patternsEnd <= data.count else {
-            // 15-sample fallback never reached unless the
-            // signature dispatch failed *and* this layout also
-            // doesn't fit. Surface as unsupportedSignature with
-            // the would-be tag bytes for diagnostics.
-            let tag = data.count >= 1084
-                ? String(bytes: data.subdata(in: 1080..<1084), encoding: .ascii) ?? "????"
-                : "<short>"
-            throw MODError.unsupportedSignature(tag)
-        }
-
-        var patterns: [MODPattern] = []
-        for p in 0..<patternCount {
-            let patBase = patternsBase + p * patternBytes
-            patterns.append(try decodePattern(
-                data: data,
-                at: patBase,
-                channelCount: channelCount
-            ))
-        }
-
-        var samples: [MODSample] = []
-        var bodyCursor = patternsEnd
-        for header in sampleHeaders {
-            let len = header.byteLength
-            var pcm: [Int8] = []
-            if len > 0 {
-                let bodyEnd = bodyCursor + len
-                let safeEnd = min(bodyEnd, data.count)
-                pcm.reserveCapacity(safeEnd - bodyCursor)
-                for i in bodyCursor..<safeEnd {
-                    pcm.append(Int8(bitPattern: data[data.startIndex + i]))
-                }
-                if safeEnd < bodyEnd {
-                    pcm.append(contentsOf: Array(repeating: Int8(0),
-                                                 count: bodyEnd - safeEnd))
-                }
-                bodyCursor = bodyEnd
+    /// Build a sample with validated loop bounds.
+    private static func makeSample(_ h: SampleHeader, data: [Int8], soundtracker: Bool) -> MODSample {
+        let length = data.count
+        var loopStart = h.loopStartBytes
+        var loopLength = h.loopLengthBytes
+        if loopLength > 2 {
+            // Ultimate Soundtracker stored the loop start in bytes, not
+            // words; undo the doubling when that is the only reading
+            // that fits the sample.
+            if soundtracker, loopStart + loopLength > h.lengthBytes,
+               loopStart / 2 + loopLength <= h.lengthBytes {
+                loopStart /= 2
             }
-            samples.append(MODSample(
-                name: header.name,
-                length: header.byteLength,
-                finetune: header.finetune,
-                volume: header.volume,
-                loopStart: header.loopStart,
-                loopLength: header.loopLength,
-                data: pcm
-            ))
+            if loopStart >= length {
+                loopLength = 0
+            } else if loopStart + loopLength > length {
+                loopLength = length - loopStart
+            }
         }
-
-        return MODFile(
-            title: title,
-            signature: .noSignature15Sample,
-            channelCount: channelCount,
-            samples: samples,
-            songLength: songLength,
-            restartByte: restartByte,
-            patternOrder: patternOrder,
-            patterns: patterns
-        )
+        if loopLength <= 2 {
+            loopStart = 0
+            loopLength = 0
+        }
+        return MODSample(name: h.name, length: length, finetune: h.finetune,
+                         volume: h.volume, loopStart: loopStart,
+                         loopLength: loopLength, data: data)
     }
 
-    // MARK: - Pattern decoding
+    // MARK: - Patterns
 
-    /// Decode one `64 × channelCount × 4`-byte pattern block.
-    private static func decodePattern(
-        data: Data,
-        at offset: Int,
-        channelCount: Int
-    ) throws -> MODPattern {
-        let cellSize = 4
-        let rowSize = channelCount * cellSize
-        let patSize = 64 * rowSize
-
-        guard offset + patSize <= data.count else {
-            throw MODError.truncated(stage: "pattern")
-        }
-
+    private static func decodeRows(_ b: [UInt8], at offset: Int, channels: Int) -> [MODRow] {
         var rows: [MODRow] = []
         rows.reserveCapacity(64)
-
         for r in 0..<64 {
-            var cells: [MODCell] = []
-            cells.reserveCapacity(channelCount)
-            for c in 0..<channelCount {
-                let base = offset + r * rowSize + c * cellSize
-                let b0 = data[data.startIndex + base]
-                let b1 = data[data.startIndex + base + 1]
-                let b2 = data[data.startIndex + base + 2]
-                let b3 = data[data.startIndex + base + 3]
-
-                // Cell encoding (per spec):
-                //   byte0: ssss pppp  (sample-hi nibble, period-hi nibble)
-                //   byte1: pppp pppp  (period-lo byte)
-                //   byte2: ssss eeee  (sample-lo nibble, effect)
-                //   byte3: pppp pppp  (effect parameter)
-                let periodHi = UInt16(b0 & 0x0F)
-                let periodLo = UInt16(b1)
-                let period = (periodHi << 8) | periodLo
-
-                let sampleHi = b0 & 0xF0
-                let sampleLo = (b2 >> 4) & 0x0F
-                let sample = sampleHi | sampleLo
-
-                let effect = b2 & 0x0F
-                let param  = b3
-
-                cells.append(MODCell(
-                    period: period,
-                    sampleNumber: sample,
-                    effect: effect,
-                    effectParam: param
-                ))
+            var row: MODRow = []
+            row.reserveCapacity(channels)
+            for c in 0..<channels {
+                row.append(decodeCell(b, at: offset + (r * channels + c) * 4))
             }
-            rows.append(cells)
+            rows.append(row)
+        }
+        return rows
+    }
+
+    @inline(__always)
+    private static func decodeCell(_ b: [UInt8], at i: Int) -> MODCell {
+        MODCell(
+            period: UInt16(b[i] & 0x0F) << 8 | UInt16(b[i + 1]),
+            sampleNumber: (b[i] & 0xF0) | (b[i + 2] >> 4),
+            effect: b[i + 2] & 0x0F,
+            effectParam: b[i + 3]
+        )
+    }
+
+    // MARK: - 15-sample validation
+
+    /// Structural checks for a tag-less file. Random or foreign data
+    /// fails at least one of these with overwhelming probability.
+    private static func looksLikeSoundtracker(_ b: [UInt8]) -> Bool {
+        guard b.count >= 600 + 1024 else { return false }
+        let songLength = Int(b[470])
+        guard (1...128).contains(songLength) else { return false }
+        let orders = b[472..<600]
+        guard orders.allSatisfy({ $0 < 128 }) else { return false }
+
+        var sampleBytes = 0
+        for i in 0..<15 {
+            let base = 20 + i * 30
+            let words = Int(readUInt16BE(b, base + 22))
+            guard words <= 32768, b[base + 25] <= 64 else { return false }
+            sampleBytes += words * 2
         }
 
-        return MODPattern(rows: rows)
+        let maxUsed = Int(orders.prefix(songLength).max() ?? 0)
+        let patternsEnd = 600 + (maxUsed + 1) * 1024
+        guard patternsEnd <= b.count else { return false }
+
+        // Every cell must reference sample 0...15 and carry either no
+        // period or one inside (a slightly widened) ProTracker range.
+        var i = 600
+        while i < patternsEnd {
+            guard b[i] & 0xF0 == 0 else { return false }
+            let period = Int(b[i] & 0x0F) << 8 | Int(b[i + 1])
+            guard period == 0 || (100...1000).contains(period) else { return false }
+            i += 4
+        }
+        // Allow lossy truncation of the sample area, but reject files
+        // that carry far more data than the headers describe.
+        let maxAll = Int(orders.max() ?? 0)
+        return b.count <= 600 + (maxAll + 1) * 1024 + sampleBytes + 4096
     }
 
     // MARK: - Byte helpers
 
-    /// Read big-endian `UInt16` at the given offset, treating the
-    /// offset as relative to the `Data`'s logical start (not
-    /// `startIndex`). Sliced `Data` values keep their original
-    /// indexing, so we explicitly add `startIndex`.
-    static func readUInt16BE(_ data: Data, at offset: Int) -> UInt16 {
-        let hi = UInt16(data[data.startIndex + offset])
-        let lo = UInt16(data[data.startIndex + offset + 1])
-        return (hi << 8) | lo
+    @inline(__always)
+    static func readUInt16BE(_ b: [UInt8], _ offset: Int) -> UInt16 {
+        UInt16(b[offset]) << 8 | UInt16(b[offset + 1])
     }
 
-    /// Read an ASCII string from `range`. Stops at the first NUL,
-    /// drops trailing whitespace and non-printable bytes, and falls
-    /// back to a best-effort Latin-1 decoding if ASCII fails (some
-    /// Amiga modules use the upper 128 code points).
-    static func readASCII(_ data: Data, range: Range<Int>) -> String {
-        let lo = data.startIndex + range.lowerBound
-        let hi = min(data.startIndex + range.upperBound, data.endIndex)
-        guard lo < hi else { return "" }
-        var bytes = [UInt8]()
-        bytes.reserveCapacity(hi - lo)
-        for i in lo..<hi {
-            let b = data[i]
-            if b == 0 { break }
-            bytes.append(b)
-        }
-        // Strip trailing non-printable / whitespace.
-        while let last = bytes.last,
-              last <= 0x20 || last == 0x7F {
+    /// Decode `count` bytes at `offset`: stop at the first NUL, strip
+    /// trailing spaces/control bytes, decode ASCII or else Latin-1.
+    static func readString(_ b: [UInt8], _ offset: Int, _ count: Int) -> String {
+        var bytes = Array(b[offset..<(offset + count)].prefix { $0 != 0 })
+        while let last = bytes.last, last <= 0x20 || last == 0x7F {
             bytes.removeLast()
         }
-        if let s = String(bytes: bytes, encoding: .ascii) { return s }
-        return String(bytes: bytes, encoding: .isoLatin1) ?? ""
+        return String(bytes: bytes, encoding: .ascii)
+            ?? String(bytes: bytes, encoding: .isoLatin1)
+            ?? ""
     }
 }
