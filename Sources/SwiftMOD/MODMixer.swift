@@ -1,402 +1,243 @@
 /// MODMixer.swift
 ///
-/// Paula-style software mixer for parsed `MODFile` instances. Renders
-/// interleaved stereo `Float32` PCM at any sample rate.
+/// Software mixer for parsed modules. Drives `MODReplayer` at the
+/// module's tick rate and renders its Paula voices to interleaved
+/// stereo `Float` PCM at any output sample rate.
 ///
-/// ## Clock model
-///
-/// ProTracker drives playback off two integers:
-///
-/// - **Speed** (ticks per row): default 6, changed by `Fxx` with `xx < 0x20`.
-/// - **Tempo** (BPM-derived): default 125, changed by `Fxx` with
-///   `xx >= 0x20`. Tick rate in Hz = `tempo × 0.4`. At 125 BPM that
-///   is the canonical 50 Hz (PAL vertical-blank frequency).
-///
-/// At each tick we call `MODEffects.dispatchEffect` for every active
-/// channel, then advance the per-channel sample positions for the
-/// number of output frames between this tick and the next.
-///
-/// ## Sample playback
-///
-/// Per channel:
-///
-/// 1. Compute playback rate from the channel's current period:
-///    `rate = 7093789.2 / (period * 2)` Hz (PAL Amiga clock).
-/// 2. Advance the Q16.16 fractional position by `rate / sampleRate`
-///    per output frame.
-/// 3. Linearly interpolate between adjacent `Int8` sample bytes,
-///    scale by `volume / 64`, and pan according to ProTracker's
-///    hard-pan layout (channels 0, 3 → left; channels 1, 2 → right;
-///    higher channels alternate L/R/R/L… modulo 4).
-/// 4. Honour sample looping: when the integer position passes
-///    `loopStart + loopLength`, wrap back to `loopStart` if
-///    `loopLength > 2`; otherwise stop the channel.
-///
-/// ## Stereo output
-///
-/// Output is always interleaved stereo, regardless of channel count.
-/// We summed sample contributions into separate left/right
-/// accumulators, then divide by `max(channelCount / 2, 1)` to keep
-/// peak energy bounded. We do soft clamping at ±1.0 — if the input
-/// module is hot enough to peak past that, the clamp turns it into a
-/// hard limiter, which is what Paula did anyway.
-///
-/// No source code from libxmp, OpenMPT, MikMod, or Schism Tracker
-/// was consulted while writing this file.
+/// No source code from libxmp, OpenMPT, MikMod, or Schism Tracker was
+/// consulted while writing this file.
 
 import Foundation
 
-// MARK: - MODMixer
-
+/// Renders a ``MODFile`` to interleaved stereo 32-bit float PCM.
+///
+/// ```swift
+/// let file = try MODFile(data: data)
+/// let mixer = MODMixer(file: file, sampleRate: 48_000)
+/// while !mixer.isFinished {
+///     let frames = mixer.renderFrames(count: 1024)   // [L, R, L, R, …]
+///     // hand `frames` to your audio output
+/// }
+/// ```
+///
+/// ## Playback model
+///
+/// Effects and timing follow ProTracker 2.x: speed (ticks per row,
+/// default 6) and tempo (BPM, default 125, tick rate = BPM × 0.4 Hz)
+/// are changed by `Fxx`; a tempo change takes effect after the tick
+/// that sets it. Voices play at `PAL clock / period` with linear
+/// interpolation and the Amiga's hard left/right/right/left panning
+/// (repeating every four channels for multichannel modules).
+///
+/// ## Termination
+///
+/// A module never "ends" on real hardware — ProTracker wraps to order 0
+/// and `Bxx`/`Dxx` can loop forever. The mixer finishes (``isFinished``
+/// becomes `true`) when:
+///
+/// - playback is about to repeat an order/row it has already played
+///   (the natural end of the order list, or a backwards `Bxx`/`Dxx`
+///   jump), unless ``Options/loopSong`` is set;
+/// - an `F00` command stops the song;
+/// - ``Options/maximumDuration`` of audio has been rendered.
+///
+/// `E6x` pattern loops are allowed to replay rows; a pathological set of
+/// interlocking pattern loops is still bounded by
+/// ``Options/maximumDuration``.
+///
+/// ## Threading
+///
+/// `MODMixer` is a mutable reference type and is not `Sendable`: use
+/// each instance from one thread (typically your audio render thread)
+/// at a time. ``render(into:)`` performs no allocation, except a
+/// one-time copy of a sample's PCM if the module uses `EFx` (invert
+/// loop), which rewrites sample data.
 public final class MODMixer {
 
-    // MARK: Public
+    /// Playback options.
+    public struct Options: Sendable, Equatable {
 
-    /// The parsed module driving this mixer.
-    public let file: MODFile
+        /// When `true`, the song restarts instead of finishing: at the
+        /// end of the order list playback continues from the restart
+        /// byte (if it is `< songLength`, otherwise order 0), and loops
+        /// created by jumps keep playing. Default `false`.
+        public var loopSong: Bool
 
-    /// Output sample rate in Hz (typically `44_100` or `48_000`).
-    public let sampleRate: Double
+        /// Hard cap on rendered audio, in seconds; the mixer finishes
+        /// once this much has been produced. `nil` removes the cap
+        /// (then a looping song renders forever). Default `3600`.
+        public var maximumDuration: Double?
 
-    /// `true` once the song reaches its end (last row of the last
-    /// pattern in the order table, with `restartByte == 0x7F` or
-    /// any out-of-range value meaning "play once").
-    public private(set) var isFinished: Bool = false
-
-    /// Initialise the mixer. The constructor does not allocate
-    /// per-tick scratch beyond `file.channelCount` channel states.
-    public init(file: MODFile, sampleRate: Double) {
-        self.file = file
-        self.sampleRate = sampleRate
-        self.song = MODSongState()
-        self.song.speed = Int(file.initialSpeed)
-        self.song.tempo = Int(file.initialTempo)
-        self.channels = Array(
-            repeating: MODChannel(),
-            count: max(file.channelCount, 1)
-        )
-        recomputeFramesPerTick()
+        /// Create options.
+        /// - Parameters:
+        ///   - loopSong: Restart at song end instead of finishing.
+        ///   - maximumDuration: Cap on rendered audio in seconds, or `nil`.
+        public init(loopSong: Bool = false, maximumDuration: Double? = 3600) {
+            self.loopSong = loopSong
+            self.maximumDuration = maximumDuration
+        }
     }
 
-    // MARK: Public API
+    // MARK: Public state
 
-    /// Render `count` interleaved stereo frames (`count × 2` floats).
-    /// Safe to call repeatedly. When `isFinished == true`, returns a
-    /// buffer of zeros.
+    /// The module being played.
+    public let file: MODFile
+
+    /// Output sample rate in Hz.
+    public let sampleRate: Double
+
+    /// The options the mixer was created with.
+    public let options: Options
+
+    /// `true` once playback has ended; further renders produce silence.
+    public private(set) var isFinished = false
+
+    /// Order position (`0..<songLength`) of the row currently playing.
+    public var currentOrder: Int { replayer.currentOrder }
+
+    /// Row (`0..<64`) currently playing.
+    public var currentRow: Int { replayer.currentRow }
+
+    /// Current speed in ticks per row.
+    public var speed: Int { replayer.speed }
+
+    /// Current tempo in BPM.
+    public var tempo: Int { replayer.tempo }
+
+    /// Number of stereo frames rendered so far (excluding the silent
+    /// padding produced after the end).
+    public private(set) var renderedFrames = 0
+
+    // MARK: Init
+
+    /// Create a mixer positioned at the start of the song.
+    ///
+    /// - Parameters:
+    ///   - file: The module to play.
+    ///   - sampleRate: Output rate in Hz. Must be finite and positive
+    ///     (typically `44_100` or `48_000`).
+    ///   - options: Looping and duration options.
+    public init(file: MODFile, sampleRate: Double, options: Options = Options()) {
+        precondition(sampleRate.isFinite && sampleRate > 0, "sampleRate must be finite and > 0")
+        self.file = file
+        self.sampleRate = sampleRate
+        self.options = options
+        self.replayer = MODReplayer(file: file, loopSong: options.loopSong)
+        if let limit = options.maximumDuration {
+            let frames = max(limit, 0) * sampleRate
+            maximumFrames = frames >= Double(Int.max) ? Int.max : Int(frames)
+        } else {
+            maximumFrames = Int.max
+        }
+    }
+
+    // MARK: Rendering
+
+    /// Render `count` stereo frames.
+    ///
+    /// - Parameter count: Number of frames; negative values are treated as `0`.
+    /// - Returns: `count × 2` interleaved samples (`L, R, …`) in `-1...1`.
+    ///   Frames after the end of the song are zero.
     public func renderFrames(count: Int) -> [Float] {
-        var out = [Float](repeating: 0, count: count * 2)
-        guard count > 0 else { return out }
-        if isFinished { return out }
-
-        // Dispatch tick 0 of the very first row before any audio is
-        // produced — otherwise the channels are still empty when we
-        // try to render.
-        if awaitingFirstTick {
-            awaitingFirstTick = false
-            dispatchRow(tick: 0)
-            recomputeFramesPerTick()
-        }
-
-        var frame = 0
-        while frame < count {
-            // Start a new tick if we exhausted the previous one.
-            if frameInTick >= framesPerTick {
-                advanceTick()
-                if isFinished { break }
-            }
-
-            // How many frames can we render before the next tick?
-            let framesLeftInTick = framesPerTick - frameInTick
-            let framesLeftInBuffer = count - frame
-            let chunk = min(framesLeftInTick, framesLeftInBuffer)
-
-            renderChunk(into: &out, startFrame: frame, frameCount: chunk)
-
-            frame += chunk
-            frameInTick += chunk
-        }
-
+        let n = max(count, 0)
+        var out = [Float](repeating: 0, count: n * 2)
+        out.withUnsafeMutableBufferPointer { _ = render(into: $0) }
         return out
     }
 
-    // MARK: Private state
-
-    private var channels: [MODChannel]
-    private var song: MODSongState
-
-    /// Frames per tick — recomputed when tempo changes.
-    private var framesPerTick: Int = 1
-    /// Counts up from 0 to `framesPerTick`.
-    private var frameInTick: Int = 0
-    /// Counts ticks within the current row (`0..<song.speed`).
-    private var tickInRow: Int = 0
-    /// `true` until we've dispatched tick 0 of the first row.
-    private var awaitingFirstTick: Bool = true
-
-    /// `7093789.2 / 2 = 3546894.6` — half the PAL Amiga clock, used
-    /// as the numerator of `rate = clock / period`. We multiply
-    /// instead of dividing to avoid the `× 2` in the hot loop.
-    private static let pauseClockHz: Double = 7_093_789.2 / 2.0
-
-    // MARK: Per-tick driver
-
-    private func advanceTick() {
-        frameInTick = 0
-
-        tickInRow += 1
-        if tickInRow >= song.speed {
-            // Row boundary. Honour pattern-delay, then move to the
-            // next row (applying pattern break / position jump).
-            tickInRow = 0
-
-            if song.pendingPatternDelayRows > 0 {
-                song.pendingPatternDelayRows -= 1
-                // Re-dispatch tick 0 of the same row.
-                dispatchRow(tick: 0)
-                recomputeFramesPerTick()
-                return
+    /// Render into a caller-provided interleaved stereo buffer without
+    /// allocating.
+    ///
+    /// - Parameter buffer: Destination for `buffer.count / 2` frames
+    ///   (`L, R, …`). It is overwritten; frames after the end of the
+    ///   song are zero-filled. A trailing odd element is zeroed.
+    /// - Returns: The number of frames of song audio written (less than
+    ///   the buffer's frame capacity once the song has finished).
+    @discardableResult
+    public func render(into buffer: UnsafeMutableBufferPointer<Float>) -> Int {
+        guard let base = buffer.baseAddress else { return 0 }
+        base.update(repeating: 0, count: buffer.count)
+        let frameCount = buffer.count / 2
+        var frame = 0
+        while frame < frameCount && !isFinished {
+            if framesLeftInTick == 0 {
+                let tempoBefore = replayer.tempo
+                replayer.tick()
+                if replayer.ended {
+                    isFinished = true
+                    break
+                }
+                let exact = sampleRate * 2.5 / Double(max(tempoBefore, 1)) + tickRemainder
+                let whole = max(Int(exact), 1)
+                tickRemainder = exact - Double(whole)
+                framesLeftInTick = whole
             }
-
-            advanceRow()
-            if isFinished { return }
-            dispatchRow(tick: 0)
-        } else {
-            dispatchRow(tick: tickInRow)
-        }
-
-        recomputeFramesPerTick()
-    }
-
-    /// Move to the next row in the pattern, honouring `Dxx`/`Bxx`.
-    private func advanceRow() {
-        var nextOrder = song.orderIndex
-        var nextRow = song.rowIndex + 1
-
-        if let breakRow = song.pendingPatternBreakRow {
-            nextRow = breakRow
-            // If a position jump is also pending, the break row
-            // applies to *that* jump's pattern.
-            if song.pendingPositionJump == nil {
-                nextOrder = song.orderIndex + 1
-            }
-            song.pendingPatternBreakRow = nil
-        } else if nextRow >= 64 {
-            nextRow = 0
-            nextOrder = song.orderIndex + 1
-        }
-
-        if let jumpTo = song.pendingPositionJump {
-            nextOrder = jumpTo
-            // If no break row was set alongside the jump, restart at 0.
-            if song.pendingPatternBreakRow == nil
-                && song.rowIndex + 1 < 64 {
-                // (already 0 from the elseif above? no — we only
-                // reset nextRow when no break was set)
-            }
-            song.pendingPositionJump = nil
-        }
-
-        if nextOrder >= file.songLength {
-            // Restart byte == 0x7F (127, the default) → "play once".
-            // Anything below `songLength` is the loop-back order.
-            if file.restartByte < UInt8(file.songLength) {
-                nextOrder = Int(file.restartByte)
-            } else {
+            var chunk = min(framesLeftInTick, frameCount - frame)
+            chunk = min(chunk, maximumFrames - renderedFrames)
+            if chunk <= 0 {
                 isFinished = true
-                return
+                break
             }
+            mix(into: base + frame * 2, frames: chunk)
+            frame += chunk
+            framesLeftInTick -= chunk
+            renderedFrames += chunk
         }
-
-        song.orderIndex = nextOrder
-        song.rowIndex = max(0, min(nextRow, 63))
+        return frame
     }
 
-    /// Dispatch the row's cells across all channels for `tick`.
-    private func dispatchRow(tick: Int) {
-        let patternIndex = Int(file.patternOrder[song.orderIndex])
-        guard patternIndex < file.patterns.count else {
-            isFinished = true
-            return
-        }
-        let pattern = file.patterns[patternIndex]
-        guard song.rowIndex < pattern.rows.count else { return }
-        let row = pattern.rows[song.rowIndex]
+    // MARK: Private
 
-        for (i, cell) in row.enumerated() where i < channels.count {
-            if tick == 0 {
-                applyNewNote(cell: cell, channelIndex: i)
-            }
-            dispatchEffect(
-                cell: cell,
-                channel: &channels[i],
-                song: &song,
-                tick: tick
-            )
+    private var replayer: MODReplayer
+    private let maximumFrames: Int
+    private var framesLeftInTick = 0
+    private var tickRemainder = 0.0
 
-            // Note-delay: when the countdown hits 0, trigger the
-            // pending cell's note.
-            if let pending = channels[i].pendingDelayedCell,
-               channels[i].noteDelayTicks == 0,
-               tick > 0 {
-                applyNewNote(cell: pending, channelIndex: i)
-                channels[i].pendingDelayedCell = nil
-            }
-        }
-    }
+    private func mix(into out: UnsafeMutablePointer<Float>, frames: Int) {
+        let voiceCount = replayer.voices.count
+        let norm = Float(max(1, (voiceCount + 1) / 2))
+        let data = replayer.sampleData
 
-    /// Apply the "new note" logic from a cell to a channel on tick 0.
-    /// Triggers sample reload, period set, finetune copy, and LFO
-    /// retrigger. Tone portamento (effect 3 or 5) suppresses the
-    /// period change so the slide can drive it instead.
-    private func applyNewNote(cell: MODCell, channelIndex i: Int) {
-        // Sample number first — ProTracker loads the sample's
-        // default volume even if the row has no period.
-        if cell.sampleNumber != 0 {
-            let idx = Int(cell.sampleNumber)
-            if idx >= 0 && idx <= file.samples.count {
-                // 1-based; sample 0 is the empty sentinel.
-                let s = idx >= 1 && idx - 1 < file.samples.count
-                    ? file.samples[idx - 1]
-                    : MODSample.empty
-                channels[i].sampleNumber = cell.sampleNumber
-                channels[i].volume = s.volume
-                channels[i].finetune = s.finetune
-            }
-        }
+        for c in 0..<voiceCount {
+            var v = replayer.voices[c]
+            guard v.active else { continue }
+            let period = v.period > 0 ? Double(v.period) : 65536
+            let step = MODPeriod.palClock / (period * sampleRate)
+            let gain = Float(min(max(v.volume, 0), 64)) / (64 * 128 * norm)
+            let left = c & 3 == 0 || c & 3 == 3
 
-        // Period — load unless this is a tone-portamento row, in
-        // which case the period is the slide target (handled in
-        // dispatch).
-        if cell.period != 0 {
-            let isTonePorta = cell.effect == 0x3 || cell.effect == 0x5
-            if isTonePorta {
-                channels[i].portaTarget = cell.period
-            } else {
-                channels[i].period = cell.period
-                channels[i].notePeriod = cell.period
-                channels[i].samplePosition = 0
-                channels[i].sampleFinished = false
-                channels[i].noteTriggered()
-            }
-        }
-    }
-
-    private func recomputeFramesPerTick() {
-        // tickHz = tempo * 0.4   (50 Hz at 125 BPM)
-        let tickHz = Double(song.tempo) * 0.4
-        guard tickHz > 0 else {
-            framesPerTick = 1
-            return
-        }
-        framesPerTick = max(1, Int((sampleRate / tickHz).rounded()))
-    }
-
-    // MARK: Frame rendering
-
-    private func renderChunk(
-        into out: inout [Float],
-        startFrame: Int,
-        frameCount: Int
-    ) {
-        let channelCount = channels.count
-        // Normalise to keep peak energy bounded as channel count
-        // grows. `max(1, ceil(N/2))` keeps a 4-channel ProTracker
-        // module roughly unity-gain.
-        let panNorm = Float(max(1, (channelCount + 1) / 2))
-
-        for c in 0..<channelCount {
-            // Look up sample once per chunk.
-            let sampleNumber = Int(channels[c].sampleNumber)
-            guard sampleNumber >= 1,
-                  sampleNumber - 1 < file.samples.count else { continue }
-            let sample = file.samples[sampleNumber - 1]
-            guard !sample.data.isEmpty,
-                  channels[c].period != 0,
-                  !channels[c].sampleFinished else { continue }
-
-            let rate = MODMixer.pauseClockHz / Double(channels[c].period)
-            let posIncrement = UInt64((rate / sampleRate * Double(1 << 16)).rounded())
-            let volume = Float(channels[c].volume) / 64.0
-            let (leftGain, rightGain) = panForChannel(c, channelCount: channelCount)
-
-            var pos = channels[c].samplePosition
-            let loopEnd = UInt64(sample.loopStart + sample.loopLength) << 16
-            let endPos = UInt64(sample.data.count) << 16
-            let loopsActive = sample.loopLength > 2
-            let loopStart = UInt64(sample.loopStart) << 16
-
-            for f in 0..<frameCount {
-                let intPos = Int(pos >> 16)
-                if intPos >= sample.data.count {
-                    if loopsActive {
-                        let overshoot = pos - loopEnd
-                        pos = loopStart &+ (overshoot
-                                            % max(loopEnd - loopStart, 1))
-                    } else {
-                        channels[c].sampleFinished = true
-                        break
-                    }
-                    continue
-                }
-
-                // Linear interpolation between data[intPos] and the
-                // next byte (looping to loopStart if necessary).
-                let s0 = Float(sample.data[intPos]) / 128.0
-                let nextIdx: Int
-                if intPos + 1 < sample.data.count {
-                    nextIdx = intPos + 1
-                } else if loopsActive {
-                    nextIdx = sample.loopStart
+            var pcm = data[v.sample]
+            var f = 0
+            while f < frames {
+                let s0 = Float(pcm[v.position])
+                let s1: Float
+                if v.position + 1 < v.end {
+                    s1 = Float(pcm[v.position + 1])
+                } else if v.loopLength > 2, v.loopSample >= 0, v.loopSample < data.count,
+                          v.loopStart < data[v.loopSample].count {
+                    s1 = Float(data[v.loopSample][v.loopStart])
                 } else {
-                    nextIdx = intPos // hold last sample
+                    s1 = s0
                 }
-                let s1 = nextIdx < sample.data.count
-                    ? Float(sample.data[nextIdx]) / 128.0
-                    : s0
-                let frac = Float(pos & 0xFFFF) / Float(1 << 16)
-                let s = s0 + (s1 - s0) * frac
-                let scaled = s * volume
+                let s = (s0 + (s1 - s0) * Float(v.fraction)) * gain
+                out[f * 2 + (left ? 0 : 1)] += s
 
-                let outIdx = (startFrame + f) * 2
-                out[outIdx]     += scaled * leftGain  / panNorm
-                out[outIdx + 1] += scaled * rightGain / panNorm
-
-                pos &+= posIncrement
-                if pos >= endPos {
-                    if loopsActive {
-                        pos = loopStart &+ ((pos - loopEnd)
-                            % max(loopEnd - loopStart, 1))
-                    } else {
-                        channels[c].sampleFinished = true
-                        // Continue the loop so subsequent frames
-                        // emit silence (already 0-initialised).
-                        break
-                    }
+                v.fraction += step
+                let advance = Int(v.fraction)
+                v.fraction -= Double(advance)
+                v.position += advance
+                if v.position >= v.end {
+                    v.reload(overshoot: v.position - v.end, data: data)
+                    guard v.active else { break }
+                    pcm = data[v.sample]
                 }
+                f += 1
             }
-
-            channels[c].samplePosition = pos
+            replayer.voices[c] = v
         }
 
-        // Soft clip at ±1.
-        let s0 = startFrame * 2
-        let s1 = (startFrame + frameCount) * 2
-        for i in s0..<s1 {
-            if out[i] > 1 { out[i] = 1 }
-            else if out[i] < -1 { out[i] = -1 }
+        for i in 0..<(frames * 2) {
+            out[i] = min(max(out[i], -1), 1)
         }
-    }
-
-    /// ProTracker hard-pan layout — channels 0 and 3 left, 1 and 2
-    /// right. For channel counts > 4 we extend the LRRL... pattern.
-    private func panForChannel(
-        _ channel: Int,
-        channelCount: Int
-    ) -> (left: Float, right: Float) {
-        // The classic ProTracker pattern repeats every 4 channels:
-        // 0:L 1:R 2:R 3:L 4:L 5:R 6:R 7:L ...
-        let phase = channel & 0x3
-        let leftFirst = (phase == 0 || phase == 3)
-        return leftFirst ? (1.0, 0.0) : (0.0, 1.0)
     }
 }

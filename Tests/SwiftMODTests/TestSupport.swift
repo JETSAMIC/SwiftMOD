@@ -85,8 +85,19 @@ struct ModBuilder {
 
     func file() throws -> MODFile { try MODFile(data: build()) }
 
+    func replayer(loop: Bool = false) throws -> MODReplayer {
+        MODReplayer(file: try file(), loopSong: loop)
+    }
+
     /// A looping-free sample of `count` bytes with a ramp body.
     static func ramp(_ count: Int, volume: UInt8 = 64) -> Sample {
         Sample(data: (0..<count).map { Int8(truncatingIfNeeded: ($0 % 100) + 1) }, volume: volume)
+    }
+}
+
+extension MODReplayer {
+    /// Run `n` ticks.
+    mutating func ticks(_ n: Int) {
+        for _ in 0..<n { tick() }
     }
 }
