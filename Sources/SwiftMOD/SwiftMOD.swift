@@ -29,7 +29,7 @@ public enum SwiftMOD {
     ///
     /// - Parameters:
     ///   - file: The module to play.
-    ///   - sampleRate: Output rate in Hz (finite, `> 0`).
+    ///   - sampleRate: Output rate in Hz, `1...1_000_000`.
     ///   - options: Looping and duration options.
     /// - Returns: A mixer positioned at the start of the song.
     public static func mixer(

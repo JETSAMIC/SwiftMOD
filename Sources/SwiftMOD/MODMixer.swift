@@ -114,11 +114,12 @@ public final class MODMixer {
     ///
     /// - Parameters:
     ///   - file: The module to play.
-    ///   - sampleRate: Output rate in Hz. Must be finite and positive
-    ///     (typically `44_100` or `48_000`).
+    ///   - sampleRate: Output rate in Hz, `1...1_000_000` (typically
+    ///     `44_100` or `48_000`). Values outside that range are a
+    ///     programming error and trap.
     ///   - options: Looping and duration options.
     public init(file: MODFile, sampleRate: Double, options: Options = Options()) {
-        precondition(sampleRate.isFinite && sampleRate > 0, "sampleRate must be finite and > 0")
+        precondition((1...1_000_000).contains(sampleRate), "sampleRate must be within 1...1_000_000 Hz")
         self.file = file
         self.sampleRate = sampleRate
         self.options = options
