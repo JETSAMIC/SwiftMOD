@@ -1,166 +1,27 @@
 # SwiftMOD
 
-A pure-Swift decoder and software mixer for Amiga-tradition `.mod` module files — Ultimate Soundtracker, NoiseTracker, ProTracker, and their multichannel descendants. No external dependencies. Foundation only. The mixer renders interleaved stereo `Float32` PCM into a caller-provided buffer, so it drops straight into `AVAudioEngine`, `AVAudioSourceNode`, or any other audio host you can hand a pointer to.
+Pure-Swift decoder and ProTracker-accurate software mixer for Amiga `.mod` modules (Soundtracker, NoiseTracker, ProTracker, StarTrekker and the multichannel `xCHN`/`xxCH` family).
 
-```swift
-let file = try MODFile(data: data)
-let mixer = MODMixer(file: file, sampleRate: 44_100)
-```
+- `MODFile` parses untrusted bytes into an immutable, `Sendable` model and throws a typed `MODError` for anything malformed — it never traps.
+- `MODMixer` renders interleaved stereo `Float` PCM at any sample rate, following ProTracker 2.x playback (period table, finetune, every effect and its quirks, Paula sample swapping).
+- Songs that loop forever (`Bxx`, `Dxx`, `E6x`) are detected, so rendering always terminates.
+- No dependencies beyond Foundation.
 
-That's the whole API surface, roughly.
+## Requirements
 
----
-
-## Contents
-
-- [What this is](#what-this-is)
-- [A short history of MOD](#a-short-history-of-mod)
-- [Supported variants](#supported-variants)
-- [The MOD file format](#the-mod-file-format)
-- [Timing model](#timing-model)
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [AVAudioEngine bridge](#avaudioengine-bridge)
-- [Status](#status)
-- [Reference](#reference)
-- [Requirements](#requirements)
-- [Contributing](#contributing)
-- [License](#license)
-
----
-
-## What this is
-
-`SwiftMOD` is a from-scratch reader for the Amiga `.mod` module format plus a Paula-style software mixer that turns the parsed data into PCM. It targets modern Swift (6.0, strict concurrency on) and ships as a single library product. There is no UI, no playback engine, no file-format autodetection. Just `MODFile` (the parser) and `MODMixer` (the renderer). Hook the mixer up to whatever audio host you like.
-
-The design constraint is "give me frames when I ask, don't allocate on the audio thread, don't pretend to be a player." Everything that isn't strictly necessary to produce samples lives outside the library.
-
-The implementation is clean-room: no source code from libxmp, OpenMPT, MikMod, or Schism Tracker was read or copied. The behavior is reconstructed from public-domain specifications (the ProTracker user manual, the FireLight `MODFIL10.TXT` technote, the Amiga Hardware Reference Manual) — see [Reference](#reference) for the full citation list.
-
-## A short history of MOD
-
-The Amiga `.mod` file is the original multichannel tracker module. Karsten Obarski's [Ultimate Soundtracker](https://en.wikipedia.org/wiki/Ultimate_Soundtracker) shipped in 1987 on the Commodore Amiga and defined the layout: a fixed sample table, a pattern grid, an order list, and 8-bit signed PCM samples played through the Amiga's [Paula](https://en.wikipedia.org/wiki/Original_Amiga_chipset#Paula) custom chip. Within a couple of years the format had been extended by NoiseTracker (Mahoney & Kaktus, 1989) — which bumped the sample table from 15 to 31 entries and added the `M.K.` signature — and then again by ProTracker (Lars Hamre and the Amiga Freelancers, 1990), which finalized the effect command set still in use today.
-
-Beyond the canonical 4-channel ProTracker variant, the demoscene produced a string of multichannel extensions in the early '90s: StarTrekker's `FLT8`, TakeTracker's `xCHN` family (6, 8, … 32 channels), Oktalyzer's `OCTA`, and the obscure Falcon-targeted `FA0x` group. SwiftMOD reads the ones that saw real-world use; see [Supported variants](#supported-variants).
-
-The format predates every other tracker module in this lineage — `.s3m`, `.xm`, `.it` are all conceptually downstream of `.mod`. The Amiga period table, the row-and-tick timing model, and the `0..F` effect numbering all originate here.
-
-## Supported variants
-
-| Signature | Channels | Pattern count | Notes |
-|-----------|---------:|--------------:|-------|
-| (none)    | 4        | up to 64      | Ultimate Soundtracker / 15-sample format |
-| `M.K.`    | 4        | up to 64      | NoiseTracker / ProTracker, the canonical 31-sample format |
-| `M!K!`    | 4        | up to 128     | ProTracker, extended pattern table |
-| `FLT4`    | 4        | up to 64      | StarTrekker 4-channel |
-| `FLT8`    | 8        | up to 64      | StarTrekker 8-channel (paired patterns) |
-| `2CHN`    | 2        | up to 64      | FastTracker stereo cut-down |
-| `6CHN`    | 6        | up to 64      | TakeTracker / FastTracker 6-channel |
-| `8CHN`    | 8        | up to 64      | TakeTracker / FastTracker 8-channel |
-| `xxCH`    | 10..32   | up to 64      | TakeTracker generalized (e.g. `16CH`, `32CH`) |
-| `OCTA`    | 8        | up to 64      | Oktalyzer 8-channel |
-| `CD81`    | 8        | up to 64      | Falcon CD81 player 8-channel |
-| `FA04`    | 4        | up to 64      | DigitalSound Falcon 4-channel |
-| `FA06`    | 6        | up to 64      | DigitalSound Falcon 6-channel |
-| `FA08`    | 8        | up to 64      | DigitalSound Falcon 8-channel |
-
-The 15-sample no-signature variant is detected by file length — the parser falls back to it when the bytes at offset 1080 don't match any known signature and the file's overall size is consistent with the 15-sample header layout.
-
-## The MOD file format
-
-MOD is a fixed-layout binary container, not a chunked one. There are no parapointers, no offsets, no length prefixes — every byte position is computed from the file's signature and the order list.
-
-### Header (1084 bytes for the 31-sample variants)
-
-| Offset | Size | Field |
-|-------:|-----:|-------|
-| `0x000` | 20   | Song name, ASCII, NUL-padded |
-| `0x014` | 930  | 31 sample headers × 30 bytes |
-| `0x3B6` | 1    | Song length (number of used order positions, 1..128) |
-| `0x3B7` | 1    | Restart byte / CIAA timer (legacy, usually `0x7F`) |
-| `0x3B8` | 128  | Pattern order table |
-| `0x438` | 4    | Format signature (`M.K.`, `M!K!`, `FLT4`, etc) |
-
-For the 15-sample no-signature variant the header is 600 bytes (20-byte name + 15 × 30-byte sample headers + 1-byte song length + 1-byte restart + 128-byte order list), with pattern data starting immediately after.
-
-### Sample header (30 bytes)
-
-| Offset | Size | Field |
-|-------:|-----:|-------|
-| `0x00` | 22   | Sample name, ASCII, NUL-padded |
-| `0x16` | 2    | Sample length in **words** (big-endian; multiply by 2 for byte length) |
-| `0x18` | 1    | Finetune (low 4 bits, signed -8..+7) |
-| `0x19` | 1    | Default volume (0..64) |
-| `0x1A` | 2    | Loop start in words (big-endian) |
-| `0x1C` | 2    | Loop length in words (big-endian; ≤ 1 word means "no loop") |
-
-### Pattern data
-
-After the header, each pattern is exactly `channels × 64 × 4` bytes, in row-major order. A single 4-byte cell encodes one note for one channel:
-
-```
-byte 0:  sssspppp
-byte 1:  pppppppp        period = (byte0 & 0x0F) << 8 | byte1     (12 bits)
-byte 2:  ssssCCCC        sample = (byte0 & 0xF0) | (byte2 >> 4)   (8 bits)
-byte 3:  pppppppp        effect = byte2 & 0x0F                    (4 bits)
-                         param  = byte3                           (8 bits)
-```
-
-A period of `0` means "no note this cell." The sample, effect, and parameter fields can still be set independently — that's how MOD encodes volume changes, slides, and pattern jumps without retriggering the sample.
-
-### Sample bodies
-
-Immediately after the pattern data, the raw 8-bit signed PCM for each sample is laid down in order, with no separator. Sample N's bytes occupy `samples[N].lengthBytes` consecutive bytes; sample 0 is conventionally empty (`length == 0`) and produces no bytes.
-
-The full byte-level layout is documented in [`Reference/MOD-Format.md`](Reference/MOD-Format.md).
-
-## Timing model
-
-MOD has two timing knobs that together determine playback rate, both set via effect `F`:
-
-- **`speed`**: number of ticks per row. Default 6. Set with `Fxx` where `xx ≤ 0x1F`.
-- **`tempo`**: tick rate in BPM-derived units. Default 125. Set with `Fxx` where `xx ≥ 0x20`.
-
-The conversion (same as every downstream tracker format) is:
-
-```
-tickRateHz     = tempo * 2 / 5
-samplesPerTick = sampleRate / tickRateHz
-samplesPerRow  = samplesPerTick * speed
-```
-
-At the defaults (`speed = 6`, `tempo = 125`, `sampleRate = 44100`) you get a 50 Hz tick (PAL VBL rate) and 882 samples per tick — the canonical Amiga timing.
-
-Sample playback rate is derived from the Amiga Paula clock. For PAL the audio clock is `7093789.2 Hz / 2 = 3546894.6 Hz`; the per-sample step is computed as `paulaClockHz / period`, where `period` ranges from 113 (highest note, B-3 with finetune +7) to 856 (lowest note, C-1 with finetune -8).
-
-Effects evaluate **once per tick**. Note triggers and tick-0-only effects (sample offset, set volume, position jump) fire on tick 0; continuous slides and modulation apply on every tick. The full effect set is documented in the [reference](#reference).
+- Swift 6.0+ / Xcode 16+
+- iOS 17+, macOS 14+, tvOS 17+, watchOS 10+, visionOS 1+ (verified against the 27.3 SDKs)
 
 ## Installation
 
-Swift Package Manager. Add to your `Package.swift`:
-
 ```swift
 dependencies: [
-    .package(url: "https://github.com/antisynthesis/SwiftMOD", from: "0.1.0")
-]
-```
-
-Then depend on the `SwiftMOD` product from your target:
-
-```swift
-.target(
-    name: "MyApp",
-    dependencies: [
+    .package(url: "https://github.com/JETSAMIC/SwiftMOD.git", from: "0.1.0")
+],
+targets: [
+    .target(name: "MyApp", dependencies: [
         .product(name: "SwiftMOD", package: "SwiftMOD")
-    ]
-)
-```
-
-For local development:
-
-```swift
-dependencies: [
-    .package(path: "../SwiftMOD")
+    ])
 ]
 ```
 
@@ -171,29 +32,48 @@ import SwiftMOD
 
 let data = try Data(contentsOf: url)
 let file = try MODFile(data: data)
-
-print(file.title)         // e.g. "stardstm.mod"
-print(file.channelCount)  // 4 for M.K., 8 for FLT8, etc
-print(file.orderCount)    // e.g. 16
+print(file.title, file.signature, file.channelCount, file.orderCount)
 
 let mixer = MODMixer(file: file, sampleRate: 44_100)
-
-let frames = 1024
-var buffer = [Float](repeating: 0, count: frames * 2) // interleaved L R
-buffer.withUnsafeMutableBufferPointer { ptr in
-    _ = mixer.render(into: ptr.baseAddress!, frames: frames)
-}
-
-if mixer.finished {
-    // Order list exhausted. Song has ended.
+var buffer = [Float](repeating: 0, count: 1024 * 2)   // interleaved L, R
+while !mixer.isFinished {
+    let frames = buffer.withUnsafeMutableBufferPointer { mixer.render(into: $0) }
+    _ = frames   // hand buffer[0 ..< frames * 2] to your audio output
 }
 ```
 
-`render(into:frames:)` returns the number of frames actually written. A short return means the song ended mid-buffer; the tail is zero-filled.
+`render(into:)` never allocates (except a one-time copy of a sample if the module uses `EFx`, which rewrites sample data) and returns the number of frames of song audio written; the rest of the buffer is zero-filled. `renderFrames(count:)` is an allocating convenience.
 
-## AVAudioEngine bridge
+### Errors
 
-Drop the mixer into an `AVAudioSourceNode` to play back on any Apple platform:
+```swift
+do {
+    _ = try SwiftMOD.decode(data)
+} catch let error as MODError {
+    print(error.localizedDescription)
+}
+```
+
+| Case | Meaning |
+|------|---------|
+| `.truncated(.header)` / `.truncated(.patterns)` | The file ends before the header or pattern data is complete |
+| `.unrecognizedFormat` | No known signature, and the data does not validate as a 15-sample Soundtracker module |
+| `.invalidSongLength(n)` | Song-length byte outside `1...128` |
+
+A file that ends inside the sample bodies (common in old archives) still loads, with the affected samples shortened and `MODFile.isTruncated == true`.
+
+### Looping and termination
+
+By default the mixer finishes when playback is about to repeat an order/row it has already played (end of the order list, or a backwards `Bxx`/`Dxx`), on `F00`, or after one hour of audio. `E6x` pattern loops do not count as a repeat.
+
+```swift
+let options = MODMixer.Options(loopSong: true, maximumDuration: 600)
+let mixer = SwiftMOD.mixer(for: file, sampleRate: 48_000, options: options)
+```
+
+With `loopSong` the song restarts from the restart byte (if `< songLength`, else order 0). `maximumDuration: nil` removes the cap.
+
+### AVAudioEngine
 
 ```swift
 import AVFoundation
@@ -201,69 +81,93 @@ import SwiftMOD
 
 final class MODPlayer {
     private let engine = AVAudioEngine()
-    private let mixer: MODMixer
-    private var sourceNode: AVAudioSourceNode!
 
     init(file: MODFile) throws {
-        let output = engine.outputNode
-        let sampleRate = output.inputFormat(forBus: 0).sampleRate
-        self.mixer = MODMixer(file: file, sampleRate: sampleRate)
-
-        let format = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: sampleRate,
-            channels: 2,
-            interleaved: true
-        )!
-
-        self.sourceNode = AVAudioSourceNode(format: format) {
-            [mixer] _, _, frameCount, audioBufferList -> OSStatus in
-            let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
-            guard let raw = ablPointer[0].mData else { return noErr }
-            let ptr = raw.assumingMemoryBound(to: Float.self)
-            _ = mixer.render(into: ptr, frames: Int(frameCount))
+        let sampleRate = engine.outputNode.outputFormat(forBus: 0).sampleRate
+        let renderer = MixerBox(MODMixer(file: file, sampleRate: sampleRate))
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate,
+                                   channels: 2, interleaved: true)!
+        let source = AVAudioSourceNode(format: format) { _, _, frameCount, bufferList in
+            let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
+            guard let raw = buffers[0].mData else { return noErr }
+            let samples = UnsafeMutableBufferPointer(
+                start: raw.assumingMemoryBound(to: Float.self), count: Int(frameCount) * 2)
+            renderer.mixer.render(into: samples)
             return noErr
         }
-
-        engine.attach(sourceNode)
-        engine.connect(sourceNode, to: engine.mainMixerNode, format: format)
+        engine.attach(source)
+        engine.connect(source, to: engine.mainMixerNode, format: format)
     }
 
     func start() throws { try engine.start() }
-    func stop()         { engine.stop() }
+    func stop() { engine.stop() }
+}
+
+/// The mixer is only ever touched from the audio render thread.
+private final class MixerBox: @unchecked Sendable {
+    let mixer: MODMixer
+    init(_ mixer: MODMixer) { self.mixer = mixer }
 }
 ```
 
-The render callback runs on the audio thread. `MODMixer` is `@unchecked Sendable` precisely because the host is expected to park it on one thread and never touch it elsewhere. There is no internal locking and concurrent renders will corrupt voice state.
+`MODMixer` is a non-`Sendable` reference type with no internal locking: use each instance from one thread at a time. All README snippets are compiled by the test suite (`READMEExampleTests.swift`).
 
-## Status
+## Spec coverage
 
-**Alpha.** The package scaffold is in place; the parser, effect engine, and mixer are being implemented from spec in subsequent commits. Public API is the two-call `MODFile(data:) → MODMixer(file:sampleRate:)` pair documented above and is expected to remain stable through the alpha cycle. Track progress against [`Reference/MOD-Format.md`](Reference/MOD-Format.md) — every documented effect command and every variant signature is a known target.
+Reference: [`Reference/MOD-Format.md`](Reference/MOD-Format.md). Playback follows ProTracker 2.x; see "ProTracker playback semantics" in that document for every quirk implemented.
 
-Tagged 0.1.0 will gate on:
+### Container
 
-- All 31-sample variants in [Supported variants](#supported-variants) parsing cleanly
-- Full ProTracker effect set 0..F including the `Exx` subgroup
-- StarTrekker `FLT8` paired-pattern decoding
-- Synthetic-fixture test coverage for parser edge cases and per-effect mixer behavior
-- Smoke tests on a corpus of public-domain MOD files
+| Feature | Status |
+|---------|--------|
+| 31-sample header (title, sample headers, song length, restart, 128-entry order table) | Supported |
+| 15-sample Ultimate Soundtracker layout (600-byte header, validated detection) | Supported (UST byte-based loop start handled; ST-specific effect semantics and tempo byte are not) |
+| `M.K.` `M!K!` `M&K!` `N.T.` `FLT4` `EXO4` | Supported (4 channels) |
+| `FLT8` paired 4-channel patterns | Supported (orders halved, pairs reassembled) |
+| `1CHN`–`9CHN`, `01CH`–`32CH`, `01CN`–`32CN`, `TDZ1`–`TDZ3`, `OCTA` `OKTA` `CD61` `CD81` `EXO8` | Supported |
+| `FA04` / `FA06` / `FA08` (Digital Tracker) | Partial — parsed with the standard layout; Digital Tracker extensions are not verified |
+| Pattern count from all 128 order entries (fallback to used entries) | Supported |
+| Sample length / loop start / loop length in words, loop length ≤ 1 word = no loop | Supported |
+| Loop bounds validated against the sample; truncated sample bodies | Supported (lenient, `isTruncated`) |
+| Finetune nibble, volume clamp to 64 | Supported |
 
-## Reference
+### Playback
 
-Byte-level format documentation, the Amiga period table, the full effect command catalog, and Paula chip behavior notes live in [`Reference/MOD-Format.md`](Reference/MOD-Format.md). That document also lists the public-domain specs SwiftMOD was implemented against.
+| Feature | Status |
+|---------|--------|
+| Exact ProTracker period table (16 finetunes × 36 notes), note quantisation | Supported |
+| Amiga period limits 113–856 (4-channel) | Supported; multichannel modules use 28–6848 and keep notes outside C-1…B-3 |
+| Speed (`F01`–`F1F`) vs BPM (`F20`–`FFF`), `F00` stops | Supported |
+| `0xy` arpeggio (incl. table overflow) | Supported |
+| `1xx` `2xx` portamento, `3xx` tone portamento, `5xy` | Supported |
+| `4xy` vibrato, `6xy`, `7xy` tremolo; sine / ramp-down / square waveforms | Supported (waveform 3 plays square, as in ProTracker) |
+| `9xx` sample offset (memory, double-apply quirk, offset past end) | Supported |
+| `Axy` `Cxx` volume | Supported |
+| `Bxx` position jump, `Dxx` pattern break (decimal, > 63 → 0, B/D ordering) | Supported |
+| `E1x` `E2x` `EAx` `EBx` fine slides | Supported |
+| `E3x` glissando, `E4x` `E7x` waveform control, `E5x` finetune | Supported |
+| `E6x` pattern loop (per channel), `EEx` pattern delay (incl. D/E6/fine-slide interactions) | Supported |
+| `E9x` retrigger, `ECx` note cut, `EDx` note delay | Supported |
+| `EFx` invert loop (funk repeat) | Supported |
+| Sample number without note (Paula loop-register swap), loop-start-0 behaviour | Supported |
+| `E0x` Amiga LED filter | Not supported (ignored) |
+| `8xx` / `E8x` panning | Not supported (ignored, as in ProTracker) |
+| Song-end detection for `Bxx`/`Dxx` loops, duration cap | Supported |
+| Output: hard LRRL panning, linear interpolation, PAL clock | Supported (no Paula BLEP synthesis or A500/A1200 RC filters) |
 
-## Requirements
+## Limitations
 
-- Swift **6.0** or later
-- Xcode **16** or later
-- Platforms: **iOS 17+**, **macOS 14+**, **tvOS 17+**, **watchOS 10+**, **visionOS 1+**
+- Interpolation is linear; there is no emulation of Paula's analogue output stage, the LED filter (`E0x`) or band-limited step synthesis.
+- `8xx`/`E8x` panning is ignored, matching ProTracker but not FastTracker-era multichannel players.
+- 15-sample modules are played with ProTracker effect semantics; Ultimate Soundtracker's different effect numbering and its tempo byte are not interpreted.
+- Interlocking `E6x` loops across channels can loop forever in ProTracker; the mixer bounds these only through `Options.maximumDuration`.
+- Playback has been verified against hand-built modules derived from the specification, not against a reference renderer on a real-world corpus.
 
-No third-party dependencies. Foundation only.
+## References
 
-## Contributing
-
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). Patches that match the "ships clean, doesn't regress, stays minimal" bar are welcome; large changes should open an issue first.
+- [`Reference/MOD-Format.md`](Reference/MOD-Format.md) — the byte-level specification this package implements, with its source list (ProTracker 2.x manual, FireLight `MODFIL10.TXT`, Amiga Hardware Reference Manual, OpenMPT wiki prose).
+- No source code from libxmp, OpenMPT, MikMod or Schism Tracker was consulted.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE).

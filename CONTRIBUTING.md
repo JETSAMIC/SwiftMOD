@@ -11,9 +11,13 @@ swift test
 The test target uses Swift Testing (the `import Testing` framework), not XCTest. Tests live in `Tests/SwiftMODTests/`. Add a test for any behavioral change — the suite is small enough that adding one or two cases is cheap and forces you to articulate intent.
 
 ```sh
-swift build       # release-ish smoke check
-swift build -c release
+swift build -c release -Xswiftc -warnings-as-errors   # must be warning-free
+xcodebuild build -scheme SwiftMOD -destination 'generic/platform=iOS' -quiet
 ```
+
+Behavioural changes to playback should cite the ProTracker behaviour they
+implement and update `Reference/MOD-Format.md` and the spec-coverage table
+in `README.md`.
 
 ## Commit style
 
