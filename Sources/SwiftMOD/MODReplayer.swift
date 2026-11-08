@@ -181,6 +181,9 @@ struct MODReplayer: Sendable {
     /// Other channel counts (FastTracker-era formats) keep notes
     /// outside C-1...B-3 and slide within 28...6848.
     let amigaLimits: Bool
+    /// `true` for 15-sample Soundtracker modules, which play only the
+    /// looped part of a looped sample.
+    let soundtracker: Bool
     private let periodFloor: Int
     private let periodCeiling: Int
 
@@ -200,6 +203,7 @@ struct MODReplayer: Sendable {
         counter = speed - 1     // first tick() starts row 0 immediately
         visited = Array(repeating: false, count: 128 * 64)
         amigaLimits = file.channelCount == 4
+        soundtracker = file.signature.sampleSlotCount == 15
         periodFloor = amigaLimits ? Int(MODPeriod.minPeriod) : 28
         periodCeiling = amigaLimits ? Int(MODPeriod.maxPeriod) : 6848
     }
@@ -317,9 +321,16 @@ struct MODReplayer: Sendable {
             if s.loops {
                 ch.loopStart = s.loopStart
                 ch.loopLength = s.loopLength
-                // A loop starting after 0 truncates playback at the loop
-                // end; with loop start 0 the whole sample plays first.
-                if s.loopStart > 0 { ch.length = s.loopStart + s.loopLength }
+                if soundtracker {
+                    // Soundtracker plays only the looped part.
+                    ch.start = s.loopStart
+                    ch.length = s.loopLength
+                } else if s.loopStart > 0 {
+                    // A loop starting after 0 truncates playback at the
+                    // loop end; with loop start 0 the whole sample plays
+                    // first.
+                    ch.length = s.loopStart + s.loopLength
+                }
             } else {
                 ch.loopStart = 0
                 ch.loopLength = 2

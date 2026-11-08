@@ -489,6 +489,26 @@ struct MODEffectsTests {
         #expect(r.voices[1].end == 40)
     }
 
+    @Test("Soundtracker modules play only the looped part of a looped sample")
+    func soundtrackerLoopOnly() throws {
+        // Spec §3.4 / §6.4: a 15-sample module plays [loopStart, loopEnd)
+        // from the first tick, whether the loop starts at 0 or later.
+        var b = ModBuilder()
+        b.tag = nil
+        var a = ModBuilder.ramp(200); a.loopStartWords = 0; a.loopLengthWords = 10
+        var c = ModBuilder.ramp(200); c.loopStartWords = 50; c.loopLengthWords = 10   // 50 bytes
+        b.samples[1] = a; b.samples[2] = c; b.samples[3] = ModBuilder.ramp(200)
+        b.set(row: 0, ch: 0, period: 428, sample: 1)
+        b.set(row: 0, ch: 1, period: 428, sample: 2)
+        b.set(row: 0, ch: 2, period: 428, sample: 3)
+        var r = try b.replayer()
+        r.tick()
+        #expect(r.voices[0].position == 0 && r.voices[0].end == 20)
+        #expect(r.voices[1].position == 50 && r.voices[1].end == 70)
+        // A one-shot sample still plays from its start to its end.
+        #expect(r.voices[2].position == 0 && r.voices[2].end == 200)
+    }
+
     @Test("Multichannel modules keep periods outside C-1...B-3")
     func extendedRange() throws {
         var b = ModBuilder()
