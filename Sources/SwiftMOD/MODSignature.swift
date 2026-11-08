@@ -45,8 +45,11 @@ public struct MODSignature: Sendable, Hashable, CustomStringConvertible {
     public static let mk = MODSignature(tag: "M.K.", channelCount: 4)
     /// `M!K!` — ProTracker, 4 channels, more than 64 patterns.
     public static let mkExtended = MODSignature(tag: "M!K!", channelCount: 4)
-    /// `M&K!` — NoiseTracker variant, 4 channels.
+    /// `M&K!` — His Master's NoiseTracker, 4 channels.
     public static let mAndK = MODSignature(tag: "M&K!", channelCount: 4)
+    /// `FEST` — His Master's NoiseTracker (the *His Master's Noise*
+    /// musicdisk), 4 channels.
+    public static let fest = MODSignature(tag: "FEST", channelCount: 4)
     /// `N.T.` — NoiseTracker, 4 channels.
     public static let nT = MODSignature(tag: "N.T.", channelCount: 4)
     /// `FLT4` — StarTrekker, 4 channels.
@@ -138,7 +141,7 @@ public struct MODSignature: Sendable, Hashable, CustomStringConvertible {
               let ascii = String(bytes: bytes, encoding: .ascii) else { return nil }
 
         let fixed: [MODSignature] = [
-            .mk, .mkExtended, .mAndK, .nT, .flt4, .flt8, .exo4, .exo8,
+            .mk, .mkExtended, .mAndK, .fest, .nT, .flt4, .flt8, .exo4, .exo8,
             .octa, .okta, .cd61, .cd81, .fa04, .fa06, .fa08
         ]
         if let match = fixed.first(where: { $0.tag == ascii }) { return match }

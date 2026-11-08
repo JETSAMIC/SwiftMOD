@@ -29,6 +29,21 @@ struct MODSignatureTests {
         #expect(MODSignature.detect(tag: tag("M!K!")) == .mkExtended)
     }
 
+    @Test("FEST and M&K! (His Master's NoiseTracker) are 4-channel tags")
+    func detectHisMastersNoiseTracker() throws {
+        #expect(MODSignature.detect(tag: tag("FEST")) == .fest)
+        #expect(MODSignature.detect(tag: tag("M&K!")) == .mAndK)
+        #expect(MODSignature.fest.channelCount == 4)
+        // Spec §4.1: a FEST module uses the plain 31-sample, 4-channel layout.
+        var b = ModBuilder()
+        b.tag = "FEST"
+        b.set(row: 63, ch: 3, period: 214, sample: 31)
+        let file = try b.file()
+        #expect(file.signature == .fest)
+        #expect(file.samples.count == 31)
+        #expect(file.patterns[0].rows[63][3] == MODCell(period: 214, sampleNumber: 31, effect: 0, effectParam: 0))
+    }
+
     @Test("FLT4 / FLT8 StarTrekker variants")
     func detectFLT() {
         #expect(MODSignature.detect(tag: tag("FLT4")) == .flt4)
