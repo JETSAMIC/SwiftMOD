@@ -121,11 +121,15 @@ Reference: [`Reference/MOD-Format.md`](Reference/MOD-Format.md). Playback follow
 | Feature | Status |
 |---------|--------|
 | 31-sample header (title, sample headers, song length, restart, 128-entry order table) | Supported |
-| 15-sample Ultimate Soundtracker layout (600-byte header, validated detection) | Supported (UST byte-based loop start handled; ST-specific effect semantics and tempo byte are not) |
-| `M.K.` `M!K!` `M&K!` `N.T.` `FLT4` `EXO4` | Supported (4 channels) |
+| 15-sample Soundtracker layout (600-byte header, validated detection) | Supported |
+| Soundtracker loop start in bytes, loop-only playback of looped samples | Supported |
+| Soundtracker effect numbering and header tempo byte | Not supported — 15-sample modules play with ProTracker effects at 125 BPM |
+| `M.K.` `M!K!` `M&K!` `FEST` `N.T.` `FLT4` `EXO4` | Supported (4 channels) |
+| His Master's NoiseTracker (`FEST`, `M&K!`) finetune scale and `7xx` | Not supported — standard finetune nibble, `7xx` plays as tremolo |
 | `FLT8` paired 4-channel patterns | Supported (orders halved, pairs reassembled) |
 | `1CHN`–`9CHN`, `01CH`–`32CH`, `01CN`–`32CN`, `TDZ1`–`TDZ3`, `OCTA` `OKTA` `CD61` `CD81` `EXO8` | Supported |
 | `FA04` / `FA06` / `FA08` (Digital Tracker) | Partial — parsed with the standard layout; Digital Tracker extensions are not verified |
+| `33CH`–`99CH`, one-off tags (`NSMS`, `LARD`, …), 8-channel `.wow` files tagged `M.K.` | Not supported (rejected as unrecognised; `.wow` read as 4 channels) |
 | Pattern count from all 128 order entries (fallback to used entries) | Supported |
 | Sample length / loop start / loop length in words, loop length ≤ 1 word = no loop | Supported |
 | Loop bounds validated against the sample; truncated sample bodies | Supported (lenient, `isTruncated`) |
@@ -137,7 +141,8 @@ Reference: [`Reference/MOD-Format.md`](Reference/MOD-Format.md). Playback follow
 |---------|--------|
 | Exact ProTracker period table (16 finetunes × 36 notes), note quantisation | Supported |
 | Amiga period limits 113–856 (4-channel) | Supported; multichannel modules use 28–6848 and keep notes outside C-1…B-3 |
-| Speed (`F01`–`F1F`) vs BPM (`F20`–`FFF`), `F00` stops | Supported |
+| Speed (`F01`–`F1F`) vs BPM (`F20`–`FFF`), `F00` stops | Supported (tick length `2.5 / BPM` s, not the integer CIA divisor) |
+| VBlank timing (every `Fxx` is a speed) | Not supported |
 | `0xy` arpeggio (incl. table overflow) | Supported |
 | `1xx` `2xx` portamento, `3xx` tone portamento, `5xy` | Supported |
 | `4xy` vibrato, `6xy`, `7xy` tremolo; sine / ramp-down / square waveforms | Supported (waveform 3 plays square, as in ProTracker) |
@@ -153,19 +158,20 @@ Reference: [`Reference/MOD-Format.md`](Reference/MOD-Format.md). Playback follow
 | `E0x` Amiga LED filter | Not supported (ignored) |
 | `8xx` / `E8x` panning | Not supported (ignored, as in ProTracker) |
 | Song-end detection for `Bxx`/`Dxx` loops, duration cap | Supported |
-| Output: hard LRRL panning, linear interpolation, PAL clock | Supported (no Paula BLEP synthesis or A500/A1200 RC filters) |
+| Output: hard LRRL panning, linear interpolation, PAL clock | Supported (no NTSC clock, Paula BLEP synthesis, A500/A1200 RC filters or stereo-separation control) |
 
 ## Limitations
 
 - Interpolation is linear; there is no emulation of Paula's analogue output stage, the LED filter (`E0x`) or band-limited step synthesis.
 - `8xx`/`E8x` panning is ignored, matching ProTracker but not FastTracker-era multichannel players.
-- 15-sample modules are played with ProTracker effect semantics; Ultimate Soundtracker's different effect numbering and its tempo byte are not interpreted.
+- 15-sample modules are played with ProTracker effect semantics; the Soundtracker versions' different effect numbering and the header tempo byte are not interpreted (loop start in bytes and loop-only playback are).
+- Modules made for VBlank timing, where `F20` and above are speeds, play too fast.
 - Interlocking `E6x` loops across channels can loop forever in ProTracker; the mixer bounds these only through `Options.maximumDuration`.
 - Playback has been verified against hand-built modules derived from the specification, not against a reference renderer on a real-world corpus.
 
 ## References
 
-- [`Reference/MOD-Format.md`](Reference/MOD-Format.md) — the byte-level specification this package implements, with its source list (ProTracker 2.x manual, FireLight `MODFIL10.TXT`, Amiga Hardware Reference Manual, OpenMPT wiki prose).
+- [`Reference/MOD-Format.md`](Reference/MOD-Format.md) — the byte-level specification this package implements, with errata, an implementation-status table and its source list (ProTracker 2.x manual, OpenMPT wiki test-case descriptions, Fraggie's SoundTracker version history, MultimediaWiki, Amiga Hardware Reference Manual).
 - No source code from libxmp, OpenMPT, MikMod or Schism Tracker was consulted.
 
 ## License
