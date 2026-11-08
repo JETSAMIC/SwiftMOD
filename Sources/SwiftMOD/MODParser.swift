@@ -171,16 +171,11 @@ enum MODParser {
     /// Build a sample with validated loop bounds.
     private static func makeSample(_ h: SampleHeader, data: [Int8], soundtracker: Bool) -> MODSample {
         let length = data.count
-        var loopStart = h.loopStartBytes
+        // Every Soundtracker version stores the loop start in bytes (the
+        // loop length is still in words); readSampleHeader doubled it.
+        var loopStart = soundtracker ? h.loopStartBytes / 2 : h.loopStartBytes
         var loopLength = h.loopLengthBytes
         if loopLength > 2 {
-            // Ultimate Soundtracker stored the loop start in bytes, not
-            // words; undo the doubling when that is the only reading
-            // that fits the sample.
-            if soundtracker, loopStart + loopLength > h.lengthBytes,
-               loopStart / 2 + loopLength <= h.lengthBytes {
-                loopStart /= 2
-            }
             if loopStart >= length {
                 loopLength = 0
             } else if loopStart + loopLength > length {

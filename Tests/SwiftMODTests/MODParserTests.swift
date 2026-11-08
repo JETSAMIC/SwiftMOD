@@ -179,6 +179,31 @@ struct MODParserTests {
         #expect(sample.loopLength == 20)
     }
 
+    @Test("Soundtracker loop start is in bytes even when a word reading would fit")
+    func soundtrackerByteLoopAlways() throws {
+        // Spec §3.4: every Soundtracker version stores the loop start in
+        // bytes. 10 read as words (20 bytes) would also fit the sample,
+        // but the stored value is 10 bytes; odd byte offsets are legal.
+        for (stored, expected) in [(UInt16(10), 10), (UInt16(7), 7)] {
+            var b = ModBuilder()
+            b.tag = nil
+            var s = ModBuilder.ramp(100)
+            s.loopStartWords = stored
+            s.loopLengthWords = 10
+            b.samples[1] = s
+            let sample = try b.file().samples[0]
+            #expect(sample.loopStart == expected)
+            #expect(sample.loopLength == 20)
+        }
+        // 31-sample modules keep loop starts in words.
+        var b = ModBuilder()
+        var s = ModBuilder.ramp(100)
+        s.loopStartWords = 10
+        s.loopLengthWords = 10
+        b.samples[1] = s
+        #expect(try b.file().samples[0].loopStart == 20)
+    }
+
     @Test("Untagged data that is not a Soundtracker module is rejected")
     func unrecognized() {
         var data = Data(repeating: 0x41, count: 4000)
